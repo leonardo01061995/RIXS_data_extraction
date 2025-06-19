@@ -14,19 +14,46 @@ from scipy.interpolate import CubicSpline
 from scipy.signal import correlate
 import xarray as xr
 from scipy.ndimage import gaussian_filter1d
+from scipy.special import wofz
+from scipy.optimize import curve_fit
+import pandas as pd
+from IPython.display import display
 
 
-class esrf_xas:
-    def __init__(self, file_path):
+class ESRF_XAS_Spectrum:
+    def __init__(self, filepaths, runs):
+        """
+        Initialize an esrf_multiple_xas object.
 
-        # Check if the file exists
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"The file {file_path} does not exist.")
+        Parameters
+        ----------
+        filepaths : list
+            List of paths to the HDF5 files.
+        runs : list
+            List of run numbers to be extracted.
+        """
+        self.runs = runs if isinstance(runs, list) else [runs]
+        # Check for duplicates in runs
+        if len(self.runs) != len(set(self.runs)):
+            raise ValueError("Duplicate run numbers found in the provided runs.")
+        
+        # Check if filepaths is a list or a single string
+        if isinstance(filepaths, list):
+            if len(filepaths) != len(runs):
+                raise ValueError("If filepaths is a list, it must have the same length as runs.")
+            if not all(isinstance(f, str) and os.path.isfile(f) for f in filepaths):
+                raise ValueError("All elements in filepaths must be valid file paths.")
+        elif isinstance(filepaths, str):
+            filepaths = [filepaths] * len(runs)
+            if not all(os.path.isfile(f) for f in filepaths):
+                raise ValueError("filepaths must be a valid file path when provided as a string.")
         else:
-            self.file_path = file_path
-            print(f"File found: {file_path}")
+            raise ValueError("filepaths must be either a list of file paths or a single file path string.")
+        
+        self.filepaths = filepaths
 
-    def extract_motor_positions(self, x):
+
+    def _extract_motor_positions(self, filepath, x):
         """
         Extract motor positions from the HDF5 file and save them into a dictionary.
         
@@ -38,12 +65,12 @@ class esrf_xas:
         dict: A dictionary containing motor names as keys and their positions as values.
         """
         x = int(x)
-        self.motor_positions = {}
+        motor_positions = {}
         try:
-            with h5py.File(self.file_path, 'r') as h5_file:
+            with h5py.File(filepath, 'r') as h5_file:
                 group_path = f'{x}.1/instrument/positioners'
                 for motor_name in h5_file[group_path].keys():
-                    self.motor_positions[motor_name] = h5_file[f'{group_path}/{motor_name}'][()]
+                    motor_positions[motor_name] = h5_file[f'{group_path}/{motor_name}'][()]
         except KeyError as e:
             print(f"Dataset not found: {e}")
             return None
@@ -53,32 +80,29 @@ class esrf_xas:
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
             return None
+        
+        motor_positions['polarization'] = self._determine_polarization(motor_positions)
 
-        return self.motor_positions
+        return motor_positions
 
-    def determine_polarization(self):
-
-        # Check if motor positions are present
-        if not hasattr(self, 'motor_positions') or not self.motor_positions:
-            raise ValueError("Motor positions have not been extracted. Please run extract_motor_positions first.")
+    @staticmethod
+    def _determine_polarization(motor_positions):
         
         # Determine polarization based on motor positions
-        if self.motor_positions['hu70cp'] > 30 and self.motor_positions['hu70ap'] > 30:
+        if motor_positions['hu70cp'] > 30 and motor_positions['hu70ap'] > 30:
             polarization = 'LV'
-        elif -2 < self.motor_positions['hu70cp'] < 2 and -2 < self.motor_positions['hu70ap'] < 2:
+        elif -2 < motor_positions['hu70cp'] < 2 and -2 < motor_positions['hu70ap'] < 2:
             polarization = 'LH'
-        elif 2 <= self.motor_positions['hu70cp'] <= 30 and 2 <= self.motor_positions['hu70ap'] <= 30:
+        elif 2 <= motor_positions['hu70cp'] <= 30 and 2 <= motor_positions['hu70ap'] <= 30:
             polarization = 'C+'
-        elif -30 <= self.motor_positions['hu70cp'] <= -2 and -30 <= self.motor_positions['hu70ap'] <= -2:
+        elif -30 <= motor_positions['hu70cp'] <= -2 and -30 <= motor_positions['hu70ap'] <= -2:
             polarization = 'C-'
         else:
             polarization = 'Unknown'
         
         return polarization
         
-
-
-    def extract_xas(self, x):
+    def _extract_xas(self, filepath, x):
         """
         Extracts datasets from an HDF5 file based on a given index.
         This function reads an HDF5 file and extracts the 'energy_enc' and 'ifluo_raw' datasets
@@ -99,15 +123,15 @@ class esrf_xas:
         
         x = int(x)
         try:
-            with h5py.File(self.file_path, 'r') as h5_file:
+            with h5py.File(filepath, 'r') as h5_file:
                 group_path = f'{x}.1/measurement'
                 try:
-                    self.energy = h5_file[f'{group_path}/energy_enc'][:]
+                    energy = h5_file[f'{group_path}/energy_enc'][:]
                 except:
-                    self.energy = h5_file[f'{group_path}/energy'][:]
-                self.xas = h5_file[f'{group_path}/ifluo_xmcd'][:]
-                self.i0 = h5_file[f'{group_path}/i0_xmcd'][:]
-                self.mir = h5_file[f'{group_path}/mir_xmcd'][:]
+                    energy = h5_file[f'{group_path}/energy'][:]
+                xas = h5_file[f'{group_path}/ifluo_xmcd'][:]
+                i0 = h5_file[f'{group_path}/i0_xmcd'][:]
+                mir = h5_file[f'{group_path}/mir_xmcd'][:]
         except KeyError as e:
             print(f"Dataset not found: {e}")
             return None, None
@@ -118,19 +142,24 @@ class esrf_xas:
             print(f"An unexpected error occurred: {e}")
             return None, None
         
-        _ = self.extract_motor_positions(x)
-
-        return self.energy, self.xas, self.i0, self.mir
+        motor_positions = self._extract_motor_positions(filepath, x)
+        data = np.stack((energy, xas, i0, mir), axis=1)
+        return data, motor_positions
     
-    
-    @staticmethod
-    def normalize_xas(energy, xas, i0=None, mir=None,
-                      normalize_by_i0=True, 
-                      normalize_by_smoothed_mir=False,
-                      linear_bkg=False,
-                      poly_order=1,
-                      range_baseline=None,
-                      range_step=None):
+    def _normalize_xas(self,
+                        energy,
+                        xas,
+                        i0=None,
+                        mir=None,
+                        normalization_method='i0',
+                        poly_coeffs_i0=None,
+                        poly_order_baseline=1,
+                        poly_order_step=1,
+                        energy_edge=None,
+                        range_baseline=None,
+                        range_step=None,
+                        normalize_step=False,
+                        remove_slope_step=False):
         """
         Normalize the XAS data by dividing by the I0 data and optionally subtracting a linear background.
         
@@ -139,12 +168,9 @@ class esrf_xas:
         i0 (numpy.ndarray): The I0 data.
         mir (numpy.ndarray): The MIR data.
         energy (numpy.ndarray): The energy values.
-        normalize_by_i0 (bool): A flag indicating whether to normalize the XAS data by the I0 data.
-                                If True, the XAS data will be divided by the I0 data.
-        normalize_by_smoothed_mir (bool): A flag indicating whether to normalize the XAS data by the smoothed MIR data.
-        linear_bkg (bool): A flag indicating whether to fit and subtract a linear background from the XAS data.
-                            If True, a linear background will be fitted to the specified ranges and subtracted.
-        poly_order (int): The order of the polynomial to fit for the linear background.
+        normalization_method (str): The normalization method to use. Options are 'i0', 'smoothed_mir', 'baseline'
+        poly_order_baseline (int): The order of the polynomial to fit for the linear background.
+        poly_order_step (int): The order of the polynomial to fit for the step.
         range_baseline (tuple): A tuple containing the energy range (in eV) to use for fitting the linear baseline.
                                 The baseline will be calculated as the mean value within this range.
         range_step (tuple): A tuple containing the energy range (in eV) to use for normalizing the XAS data.
@@ -155,30 +181,40 @@ class esrf_xas:
             - energy (numpy.ndarray): The energy values.
             - xas_norm (numpy.ndarray): The normalized XAS data.
         """
+        if range_baseline is None: 
+            raise Exception("Range for baseline fitting must be provided.")
         
-        if normalize_by_i0:
+        if range_step is None:
+            raise Exception("Range for step fitting must be provided.")
+        
+        if normalization_method not in ['i0', 'smoothed_mir', 'baseline', 'i0_fit']:
+            raise ValueError("Invalid normalization method. Choose 'i0', 'smoothed_mir', or 'baseline'.")
+        
+        n1_baseline = np.searchsorted(energy, range_baseline[0])
+        n2_baseline = np.searchsorted(energy, range_baseline[1])
 
+        if normalization_method == 'i0':
             if i0 is None:
                 raise ValueError("I0 data must be provided to normalize by I0.")
-            xas_norm_i0 = xas / i0
-        else:
-            xas_norm_i0 = xas / 1E6
+            xas_norm = xas / i0
+            norm_signal = i0
 
-        if normalize_by_smoothed_mir:
+        elif normalization_method == 'smoothed_mir':
             # Apply Gaussian filter to smooth the 'mir' data
-
+            
             if mir is None:
                 raise ValueError("MIR data must be provided to normalize by smoothed MIR.")
 
-            mir_smoothed = gaussian_filter1d(mir, sigma=20)  # Adjust sigma as needed
+            mir_smoothed = gaussian_filter1d(mir, sigma=40)  # Adjust sigma as needed
 
             # Normalize by the smoothed 'mir' data
-            xas_norm_i0 = xas / mir_smoothed
+            xas_norm = xas / mir_smoothed 
+            norm_signal = mir_smoothed
 
             # # Plot the original and smoothed 'mir' data
             # plt.figure(figsize=(10, 5))
-            # plt.plot(self.energy, self.mir, label='Original MIR')
-            # plt.plot(self.energy, mir_smoothed, label='Smoothed MIR', linestyle='--')
+            # plt.plot(energy, mir, label='Original MIR')
+            # plt.plot(energy, mir_smoothed, label='Smoothed MIR', linestyle='--')
             # plt.xlabel('Energy (eV)')
             # plt.ylabel('MIR')
             # plt.legend()
@@ -186,62 +222,115 @@ class esrf_xas:
             # plt.grid()
             # plt.show()
 
-        if not linear_bkg:
-            # Subtract the baseline, and normalize by the step
-            if range_baseline is not None:
-                n1_baseline = np.searchsorted(energy, range_baseline[0])
-                n2_baseline = np.searchsorted(energy, range_baseline[1])
-                baseline = np.mean(xas_norm_i0[n1_baseline:n2_baseline])
-            else:
-                baseline = 0
+        elif normalization_method == 'i0_fit':
+            if i0 is None:
+                raise ValueError("I0 data must be provided to normalize by I0.")
+            # Fit a polynomial to the I0 data
+            i0_fit = np.polyval(poly_coeffs_i0, energy)
+            baseline = np.mean(xas[n1_baseline:n2_baseline])
+            xas_norm = xas / baseline
+            xas_norm = xas_norm / i0_fit
+            norm_signal = i0_fit
 
-            if range_step is not None:
-                n1_step = np.searchsorted(energy, range_step[0])
-                n2_step = np.searchsorted(energy, range_step[1])
-                step = np.mean(xas_norm_i0[n1_step:n2_step] / baseline -1)
-            else:
-                step = 1
-            xas_norm = (xas_norm_i0 / baseline - 1) / step
+        elif normalization_method == 'baseline':
+            baseline = np.mean(xas[n1_baseline:n2_baseline])
+            xas_norm = xas / baseline
+            norm_signal = np.full_like(energy, baseline)
 
-        if linear_bkg:
-            # Fit a linear background to the specified range
-            if range_baseline is not None:
-                n1_baseline = np.searchsorted(energy, range_baseline[0])
-                n2_baseline = np.searchsorted(energy, range_baseline[1])
-                baseline = np.mean(xas_norm_i0[n1_baseline:n2_baseline])
-            else:
-                raise Exception("Range for baseline fitting must be provided when linear_bkg is True.")
-            
-            x_fit = energy[n1_baseline:n2_baseline]
-            y_fit = xas_norm_i0[n1_baseline:n2_baseline]
-            coeffs = np.polyfit(x_fit, y_fit, poly_order)
-            linear_bkg = np.polyval(coeffs, energy)
-            xas_pure = (xas_norm_i0 - linear_bkg)
+        #remove the background in the baseline        
+        x_fit = energy[n1_baseline:n2_baseline]
+        y_fit = xas_norm[n1_baseline:n2_baseline]
+        coeffs_baseline = np.polyfit(x_fit, y_fit, poly_order_baseline)
+        linear_bkg_baseline = np.polyval(coeffs_baseline, energy)
+        xas_pure = (xas_norm - linear_bkg_baseline)
+
+        if remove_slope_step or normalize_step:
+            #Calculate the step
             # Normalize by the step
-            if range_step is not None:
-                n1_step = np.searchsorted(energy, range_step[0])
-                n2_step = np.searchsorted(energy, range_step[1])
-                step = np.mean(xas_pure[n1_step:n2_step])
-            else:
-                step = 1
+            n1_step = np.searchsorted(energy, range_step[0])
+            n2_step = np.searchsorted(energy, range_step[1])
+            x_fit = energy[n1_step:n2_step]
+            y_fit = xas_norm[n1_step:n2_step]
+            coeffs_step = np.polyfit(x_fit, y_fit, poly_order_step)
+            linear_bkg_step = np.polyval(coeffs_step, energy)
 
-            xas_norm = xas_pure / step
+        if remove_slope_step:
+            max_order_poly = max(poly_order_baseline+1, poly_order_step+1)
+            # Expand coeffs_baseline and coeffs_step to have dimension max_order_poly, filling new values with zeros at the beginning
+            coeffs_baseline = np.pad(coeffs_baseline, (max_order_poly - len(coeffs_baseline), 0), mode='constant')
+            coeffs_step = np.pad(coeffs_step, (max_order_poly - len(coeffs_step), 0), mode='constant')
+            if energy_edge is None:
+                raise ValueError("Energy edge must be provided to remove slope after the edge.")
+            # Compute the difference between the two polynomials after energy_edge, excluding the constant term
+            # Get the indices after energy_edge
+            indices_after_edge = np.where(energy > energy_edge)[0]
+            if len(indices_after_edge) > 0:
+                # Remove the constant term (last coefficient) from both polynomials
+                coeffs_baseline_no_const = coeffs_baseline.copy()
+                coeffs_baseline_no_const[-1] = 0
+                coeffs_step_no_const = coeffs_step.copy()
+                coeffs_step_no_const[-1] = 0
+                # Compute the difference polynomial (without constant term)
+                diff_poly_coeffs = coeffs_step_no_const - coeffs_baseline_no_const
+                # Evaluate the difference polynomial at the energy points after energy_edge
+                diff_curve = np.polyval(diff_poly_coeffs, energy[indices_after_edge])
+                # Subtract this curve from xas_pure after energy_edge
+                xas_pure[indices_after_edge] -= diff_curve - np.polyval(diff_poly_coeffs, energy_edge)
 
-        return energy, xas_norm
+        xas_processed = xas_pure.copy()
+        if normalize_step:
+            if energy_edge is None:
+                raise ValueError("Energy edge must be provided to normalize by step.")
+
+            step = np.polyval(coeffs_step, energy_edge)-np.polyval(coeffs_baseline, energy_edge)
+            xas_processed /= step
+
+
+        return energy, xas_processed, norm_signal
     
     def extract_xmcd(self, 
-                     runs=None,
                      automatically_sort_pm = True,
                      runs_p=None,
                      runs_m=None,
-                     normalize_after=False,
-                     normalize_by_i0=True, 
-                     normalize_by_smoothed_mir = False,
-                     linear_bkg=False,
-                     poly_order = 1,
-                     range_baseline=None,
-                     range_step=None,
-                     plot=False):
+                     plot=False,
+                     save_hdf5=False,
+                     filepath_save='',
+                     **norm_params):
+        """
+        Extract XMCD data from the specified runs and filepaths.
+        Parameters
+        ----------
+        automatically_sort_pm : bool
+            Whether to automatically sort runs into C+ and C- based on motor positions.
+        runs_p : list, optional
+            List of runs to be considered as C+ (positive polarization) runs.
+        runs_m : list, optional
+            List of runs to be considered as C- (negative polarization) runs.
+        plot : bool
+            Whether to plot the extracted XMCD data.
+        save_hdf5 : bool
+            Whether to save the extracted data to an HDF5 file.
+        filepath_save : str
+            The file path to save the HDF5 file.
+        norm_params : dict  
+            Parameters for normalization. Contains:
+                normalization_method : str
+                    The normalization method to use. Options are 'i0', 'smoothed_mir', 'baseline'
+                poly_order_baseline : int
+                    The order of the polynomial to fit for the linear background.
+                poly_order_step : int
+                    The order of the polynomial to fit for the step.
+                energy_edge : float
+                    The energy edge for removing the slope.
+                range_baseline : tuple
+                    A tuple containing the energy range (in eV) to use for fitting the linear baseline.
+                range_step : tuple
+                    A tuple containing the energy range (in eV) to use for normalizing the XAS data.
+                normalize_step : bool
+                    Whether to normalize the XAS data by the step.
+                remove_slope_step : bool    
+                    Whether to remove the slope after the energy edge.
+        """
         
         runs_p = runs_p if runs_p is not None else []
         runs_m = runs_m if runs_m is not None else []
@@ -250,121 +339,673 @@ class esrf_xas:
 
             print("Automatically sorting C+ and C- runs...")
             runs_p = []
+            filepaths_p = []
             runs_m = []
+            filepaths_m = []
 
-            if runs is None:
-                raise ValueError("If automatically_sort_pm is True, runs must be provided.")
-            for run in runs:
-                _ = self.extract_motor_positions(run)
-                if self.determine_polarization() == 'C+':
+            for filepath, run in zip(self.filepaths, self.runs):
+                motor_positions = self._extract_motor_positions(filepath, run)
+                if self._determine_polarization(motor_positions) == 'C+':
                     runs_p.append(run)
-                elif self.determine_polarization() == 'C-':
+                    filepaths_p.append(filepath)
+                elif self._determine_polarization(motor_positions) == 'C-':
                     runs_m.append(run)
+                    filepaths_m.append(filepath)
                 else:
                     print(f"Warning: Run {run} is nor C+ neither C- \n\n")
             print(f" Runs C+: {runs_p} \n Runs C-: {runs_m}")
 
-        all_runs_p = []
-        all_runs_m = []
-        for run in runs_p:
-            energy, xas_norm,_,_ = self.extract_xas(run)
-
-            if not normalize_after:
-                energy, xas_norm = self.normalize_xas(self.energy, self.xas, i0=self.i0, mir=self.mir,
-                                                    normalize_by_i0=normalize_by_i0, 
-                                                    normalize_by_smoothed_mir=normalize_by_smoothed_mir,
-                                                    linear_bkg=linear_bkg, 
-                                                    poly_order=poly_order,
-                                                    range_baseline=range_baseline, 
-                                                    range_step=range_step)
-            if not all_runs_p:
-                energy0 = energy
-            run_data = np.interp(energy0, energy, xas_norm)
-            all_runs_p.append(run_data)
+        #extract C+ scans
+        self.filepaths = filepaths_p
+        self.runs = runs_p
+        self.all_xas_ds_p = self.extract_and_normalize_xas(**norm_params)
         
-        for run in runs_m:
-            energy, xas_norm,_,_ = self.extract_xas(run)
+        self.avg_ds_p = self._average_xas(self.all_xas_ds_p)
 
-            if not normalize_after:
-                energy, xas_norm = self.normalize_xas( self.energy, self.xas, i0=self.i0, mir=self.mir,
-                                                    normalize_by_i0=normalize_by_i0, 
-                                                    normalize_by_smoothed_mir=normalize_by_smoothed_mir,
-                                                    linear_bkg=linear_bkg, 
-                                                    poly_order=poly_order,
-                                                    range_baseline=range_baseline, 
-                                                    range_step=range_step)
-            
-            run_data = np.interp(energy0, energy, xas_norm)
-            all_runs_m.append(run_data)
+        #extract C- scans
+        self.filepaths = filepaths_m
+        self.runs = runs_m
+        self.all_xas_ds_m = self.extract_and_normalize_xas(**norm_params)
+        
+        
+        #interpolate all the runs on the same energy0, from C+ xas spectra
+        energy0 = self.avg_ds_p['avg_xas'].sel(variable='energy').values
+        for run in self.all_xas_ds_m.data_vars:
+            energy = self.all_xas_ds_m[run].sel(variable='energy').values
+            xas_norm = self.all_xas_ds_m[run].sel(variable='xas_norm').values
+            # i0 = self.all_xas_ds_m[run].sel(variable='i0').values
+            # mir = self.all_xas_ds_m[run].sel(variable='mir').values
+            norm_signal = self.all_xas_ds_m[run].sel(variable='norm').values
 
-        avg_runs_p = np.mean(all_runs_p, axis=0)
-        avg_runs_m = np.mean(all_runs_m, axis=0)
+            #interpolate
+            xas_norm_interp = np.interp(energy0, energy, xas_norm)
+            # i0_interp = np.interp(energy0, energy, i0)
+            # mir_interp = np.interp(energy0, energy, mir)
+            norm_signal_interp = np.interp(energy0, energy, norm_signal)
 
-        if plot:
-            fig, axs = plt.subplots(1, 2, figsize=(10, 4))
-            
-            # Plot all runs_p and their average
-            for i, run_data in enumerate(all_runs_p):
-                axs[0].plot(energy0, run_data, label=f"Run C+ {runs_p[i]}")
-            axs[0].plot(energy0, avg_runs_p, label="Average C+", linewidth=2, color='black')
-            axs[0].set_xlabel('Energy (eV)')
-            axs[0].set_ylabel('XAS')
-            axs[0].legend()
-            axs[0].grid()
-            axs[0].set_title(f'C+ Runs and Average: B = {self.motor_positions["magnet"]:.1f} T')
-            
-            # Plot all runs_m and their average
-            for i, run_data in enumerate(all_runs_m):
-                axs[1].plot(energy0, run_data, label=f"Run C- {runs_m[i]}")
-            axs[1].plot(energy0, avg_runs_m, label="Average C-", linewidth=2, color='black')
-            axs[1].set_xlabel('Energy (eV)')
-            axs[1].set_ylabel('XAS')
-            axs[1].legend()
-            axs[1].grid()
-            axs[1].set_title(f'C- Runs and Average B = {self.motor_positions["magnet"]:.1f} T')
-            
-            plt.tight_layout()
-            plt.show()
+            #replace the values
+            self.all_xas_ds_m[run].loc[dict(variable='energy')] = energy0
+            self.all_xas_ds_m[run].loc[dict(variable='xas_norm')] = xas_norm_interp
+            # self.all_xas_ds_m[run].loc[dict(variable='i0')] = i0_interp
+            # self.all_xas_ds_m[run].loc[dict(variable='mir')] = mir_interp  
+            self.all_xas_ds_m[run].loc[dict(variable='norm')] = norm_signal_interp
 
-        if normalize_after:
-            _, avg_runs_p = self.normalize_xas(energy, avg_runs_p, i0=self.i0, mir=self.mir,
-                                                normalize_by_i0=normalize_by_i0, 
-                                                normalize_by_smoothed_mir=normalize_by_smoothed_mir,
-                                                linear_bkg=linear_bkg, 
-                                                poly_order=poly_order,
-                                                range_baseline=range_baseline, 
-                                                range_step=range_step)
-            _, avg_runs_m = self.normalize_xas(energy, avg_runs_m, i0=self.i0, mir=self.mir,
-                                                normalize_by_i0=normalize_by_i0, 
-                                                normalize_by_smoothed_mir=normalize_by_smoothed_mir,
-                                                linear_bkg=linear_bkg, 
-                                                poly_order=poly_order,
-                                                range_baseline=range_baseline, 
-                                                range_step=range_step)
+        self.avg_ds_m = self._average_xas(self.all_xas_ds_m) 
 
-        avg = (avg_runs_p + avg_runs_m)/2
-        xmcd = (avg_runs_p - avg_runs_m)
+        #calculate the data structure for xmcd
+        xmcd = self.avg_ds_p['avg_xas'].sel(variable='xas_norm').values - self.avg_ds_m['avg_xas'].sel(variable='xas_norm').values
 
-        xmcd_data = np.column_stack((energy0, avg, xmcd))
+        self.xmcd_ds = xr.Dataset()
+        self.xmcd_ds['C+'] = self.avg_ds_p['avg_xas'].copy(deep=True)
+        self.xmcd_ds['C-'] = self.avg_ds_m['avg_xas'].copy(deep=True)
+        self.xmcd_ds['xmcd'] = xr.DataArray(
+            data=np.stack((energy0, xmcd), axis=1),
+            dims=['points', 'variable'],
+            coords={
+                'points': np.arange(energy0.shape[0]),
+                'variable': ['energy', 'xas_norm']
+            }
+        )
 
         if plot:
-            # Plot XMCD data
-            plt.figure(figsize=(10, 4))
-            plt.plot(xmcd_data[:, 0], avg_runs_p, label=f"C+", linewidth=2)
-            plt.plot(xmcd_data[:, 0], avg_runs_m, label=f"C-", linewidth=2)
-            plt.plot(xmcd_data[:, 0], xmcd_data[:, 2] * 3, label=f"3*(C+ - C-)", linewidth=2)
-            plt.xlabel('Energy (eV)')
-            plt.ylabel('XMCD')
-            plt.title(f'XMCD, B = {self.motor_positions["magnet"]:.1f} T')
-            plt.legend()
-            plt.grid()
-            plt.show()
+            self.plot_xmcd(string_title='XMCD')
+
+        if save_hdf5:
+            self.save_xas_to_hdf5(filepath_save, self.xmcd_ds)
 
 
-        return all_runs_p, all_runs_m, xmcd_data     
+    def extract_and_normalize_xas(self,
+                     plot=False,
+                     string_title='XAS',
+                     save_hdf5=False,
+                     save_avg_xas=False,
+                     filepath_save='',
+                     **norm_params):
+        """
+        Extract and normalize XAS data from the specified files.
+        Parameters
+        ----------
+        plot : bool
+            Whether to plot the extracted and normalized XAS data.
+        string_title : str
+            The title for the plot.
+        save_hdf5 : bool
+            Whether to save the extracted data to an HDF5 file.
+        save_avg_xas: bool
+            Whether to save the average XAS data to an HDF5 file.
+        filepath_save : str
+            The file path to save the HDF5 file.
+        norm_params : dict
+            Parameters for normalization. Contains:
+                normalization_method : str
+                    The normalization method to use. Options are 'i0', 'smoothed_mir', 'baseline'
+                poly_order_baseline : int
+                    The order of the polynomial to fit for the linear background.
+                poly_order_step : int
+                    The order of the polynomial to fit for the step.
+                energy_edge : float
+                    The energy edge for removing the slope.
+                range_baseline : tuple
+                    A tuple containing the energy range (in eV) to use for fitting the linear baseline.
+                range_step : tuple
+                    A tuple containing the energy range (in eV) to use for normalizing the XAS data.
+                normalize_step : bool
+                    Whether to normalize the XAS data by the step.
+                remove_slope_step : bool    
+                    Whether to remove the slope after the energy edge.
+        """
+
+        self.all_xas_ds = xr.Dataset()
+        for ii, (filepath,run) in enumerate(zip(self.filepaths, self.runs)):
+            data, motor_positions = self._extract_xas(filepath, run)
+
+            _, xas_norm, norm_signal = self._normalize_xas(data[:,0], data[:,1], i0=data[:,2], mir=data[:,3],
+                                              **norm_params)
+
+            # data = np.stack((data[:,0], data[:,1], xas_norm, data[:,2], data[:,3]), axis=1)
+            data = np.stack((data[:,0], data[:,1], xas_norm, norm_signal), axis=1)
+
+            # Save data and motor positions as an xarray inside the xr.Dataset
+            data_xr = xr.DataArray(
+                data,
+                dims=['points', 'variable'],
+                coords={
+                    'points': np.arange(data.shape[0]),
+                    'variable': ['energy', 'xas', 'xas_norm', 'norm']
+                }
+            )
+            # Add motor positions as attributes
+            if motor_positions is not None:
+                for k, v in motor_positions.items():
+                    data_xr.attrs[k] = v
+            # Add to the dataset with a unique name
+            data_xr.attrs['filepath'] = filepath
+            data_xr.attrs['run'] = run
+            data_xr.attrs['normalization_method'] = norm_params.get('normalization_method')
+            data_xr.attrs['poly_order_baseline'] = norm_params.get('poly_order_baseline')
+            data_xr.attrs['poly_order_step'] = norm_params.get('poly_order_step')
+            data_xr.attrs['energy_edge'] = norm_params.get('energy_edge')
+            data_xr.attrs['range_baseline'] = norm_params.get('range_baseline')
+            data_xr.attrs['range_step'] = norm_params.get('range_step')
+            data_xr.attrs['normalize_step'] = str(norm_params.get('normalize_step'))
+            data_xr.attrs['remove_slope_step'] = str(norm_params.get('remove_slope_step'))
+
+            #save in the main xr.Dataset
+            self.all_xas_ds[f'{ii}'] = data_xr.copy(deep=True)
+
+        # Calculate and store the average XAS as an attribute
+        self.avg_xas_ds = self._average_xas(self.all_xas_ds)
+        # self.all_xas_ds[f'avg_xas'] = self.avg_xas['avg_xas'].copy(deep=True)
+
+        if plot:
+            self.plot_xas(string_title=string_title)
+
+        if save_hdf5:
+            if save_avg_xas:
+                self.save_xas_to_hdf5(filepath_save, self.avg_xas_ds)
+            else:
+                self.save_xas_to_hdf5(filepath_save, self.all_xas_ds)
+
+        return self.all_xas_ds
+
+    @staticmethod
+    def _average_xas(all_xas_ds):
+        """
+        Calculate the average XAS data from all runs.
+        """
+        
+        # Calculate the average XAS data
+        energy0 = all_xas_ds[list(all_xas_ds.data_vars)[0]].sel(variable='energy').values
+        xas_list = []
+        xas_norm_list = []
+        # i0_list = []
+        # mir_list = []
+        norm_list = []
+        runs=[]
+        for ii, run_data in enumerate(all_xas_ds.data_vars):
+            energy = all_xas_ds[run_data].sel(variable='energy').values
+            xas = all_xas_ds[run_data].sel(variable='xas').values
+            xas_norm = all_xas_ds[run_data].sel(variable='xas_norm').values
+            # i0 = all_xas_ds[run_data].sel(variable='i0').values
+            # mir = all_xas_ds[run_data].sel(variable='mir').values
+            norm_values = all_xas_ds[run_data].sel(variable='norm').values
+            xas_list.append(np.interp(energy0, energy, xas))
+            xas_norm_list.append(np.interp(energy0, energy, xas_norm))
+            # i0_list.append(np.interp(energy0, energy, i0))
+            # mir_list.append(np.interp(energy0, energy, mir))
+            norm_list.append(np.interp(energy0, energy, norm_values))
+            runs.append(all_xas_ds[run_data].attrs.get('run', '?'))
+            if ii==0:
+                #copy all the attribures (e.g. motor positions) from the first run
+                other_attrs = {key: value for key, value in all_xas_ds[run_data].attrs.items()
+                                if key not in ["filepath", "run"]}
+                filepath = os.path.dirname(all_xas_ds[run_data].attrs.get('filename', '?'))
+
+            
+            # Check for differences in attributes across runs
+            for key, value in other_attrs.items():
+                if key in all_xas_ds[run_data].attrs:
+                    current_value = all_xas_ds[run_data].attrs[key]
+                    if isinstance(current_value, (int, float)) and isinstance(value, (int, float)):
+                        # Perform numeric comparison
+                        if abs(current_value - value) > 0.1:
+                            print(f"******Warning******: Attribute '{key}' differs by more than 0.1 between spectra. "
+                                f"Value in current spectrum: {current_value}, "
+                                f"Value in other_attrs: {value}")
+                    else:
+                        # Perform string comparison
+                        if str(current_value) != str(value):
+                            print(f"******Warning******: Attribute '{key}' differs between spectra. "
+                                f"Value in current spectrum: {current_value}, "
+                                f"Value in other_attrs: {value}")
+
+        avg_xas_xarray = xr.DataArray(
+            data=np.stack([
+                energy0,
+                np.mean(xas_list, axis=0),
+                np.mean(xas_norm_list, axis=0),
+                # np.mean(i0_list, axis=0),
+                # np.mean(mir_list, axis=0)
+                np.mean(norm_list, axis=0)
+            ], axis=1),
+            dims=['points', 'variable'],
+            coords={
+                'points': np.arange(len(energy0)),
+                'variable': ['energy', 'xas', 'xas_norm', 'norm']
+            }
+        )
+        avg_xas_xarray.attrs['filepath'] = filepath
+        avg_xas_xarray.attrs['run'] = runs
+        for key, value in other_attrs.items():
+            avg_xas_xarray.attrs[key] = value
+        avg_xas = xr.Dataset({'avg_xas': avg_xas_xarray})
+
+        return avg_xas
+
+    def plot_xas(self, string_title=''):
+        plt.figure(figsize=(10, 4))
+        
+        # Plot all runs_p and their average
+        for i, run_data in enumerate(self.all_xas_ds.data_vars):
+            energy = self.all_xas_ds[run_data].sel(variable='energy').values
+            data_norm = self.all_xas_ds[run_data].sel(variable='xas_norm').values
+            plt.plot(energy, data_norm, label=f"Run {self.all_xas_ds[run_data].attrs.get('run', run_data)}")
+        # Plot the average XAS if it exists
+        if hasattr(self, 'avg_xas') and self.avg_xas is not None:
+            avg_xas = self.avg_xas['avg_xas'].sel(variable='xas_norm').values
+            plt.plot(self.avg_xas['avg_xas'].sel(variable='energy').values, avg_xas, 
+                     label="Average XAS", linewidth=2, color='black')
+        plt.xlabel('Energy (eV)')
+        plt.ylabel('XAS (arb. units)')
+        plt.legend()
+        plt.grid()
+        plt.title(f'{string_title}')
+        plt.show()             
+
+    def plot_xmcd(self, string_title=''):
+        fig = plt.figure(figsize=(10, 6))
+        gs = fig.add_gridspec(2, 2, height_ratios=[1, 1], width_ratios=[1, 1])
+        axs = np.empty((2, 2), dtype=object)
+        axs[0, 0] = fig.add_subplot(gs[0, 0])
+        axs[0, 1] = fig.add_subplot(gs[0, 1])
+        # Merge the two columns in the second row for XMCD
+        axs[1, 0] = fig.add_subplot(gs[1, :])
+        
+        # Plot all runs_p and their average
+        for i, run_data in enumerate(self.all_xas_ds_p.data_vars):
+            energy = self.all_xas_ds_p[run_data].sel(variable='energy').values
+            data_norm = self.all_xas_ds_p[run_data].sel(variable='xas_norm').values
+            axs[0,0].plot(energy, data_norm, label=f"Run C+ {self.all_xas_ds_p[run_data].attrs.get('run')}")
+        # Plot the average XAS if it exists
+        energy0 = self.avg_ds_p['avg_xas'].sel(variable='energy').values
+        avg_runs_p = self.avg_ds_p['avg_xas'].sel(variable='xas_norm').values
+        axs[0,0].plot(energy0, avg_runs_p, label="Average C+", linewidth=2, color='black')
+        axs[0,0].set_xlabel('Energy (eV)')
+        axs[0,0].set_ylabel('XAS')
+        axs[0,0].legend()
+        axs[0,0].grid()
+        axs[0,0].set_title('C- Runs'+string_title)
+        
+        # Plot all runs_m and their average
+        for i, run_data in enumerate(self.all_xas_ds_m.data_vars):
+            energy = self.all_xas_ds_m[run_data].sel(variable='energy').values
+            data_norm = self.all_xas_ds_m[run_data].sel(variable='xas_norm').values
+            axs[0,1].plot(energy, data_norm, label=f"Run C+ {self.all_xas_ds_m[run_data].attrs.get('run')}")
+        # Plot the average XAS if it exists
+        energy0 = self.avg_ds_m['avg_xas'].sel(variable='energy').values
+        avg_runs_m = self.avg_ds_m['avg_xas'].sel(variable='xas_norm').values
+        axs[0,1].plot(energy0, avg_runs_m, label="Average C+", linewidth=2, color='black')
+        axs[0,1].set_xlabel('Energy (eV)')
+        axs[0,1].set_ylabel('XAS')
+        axs[0,1].legend()
+        axs[0,1].grid()
+        axs[0,1].set_title('C- Runs'+string_title)
+
+        # Plot XMCD data
+        energy0 = self.xmcd_ds['xmcd'].sel(variable='energy').values
+        xmcd_data = self.xmcd_ds['xmcd'].sel(variable='xas_norm').values
+        axs[1,0].plot(energy0, avg_runs_p, label="Avg C+", color='red')
+        axs[1,0].plot(energy0, avg_runs_m, label="Avg C-", color='blue')
+        axs[1,0].plot(energy0, xmcd_data*3, label="XMCD*3", color='black')
+        axs[1,0].set_xlabel('Energy (eV)')
+        axs[1,0].set_ylabel('Intensity (arb. units)')
+        axs[1,0].set_title('XMCD'+string_title)
+        axs[1,0].grid()
+        axs[1,0].legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    @staticmethod
+    def save_xas_to_hdf5(file_path_save, ds):
+        """
+        Save the XAS data to an HDF5 file.
+        """
+        if file_path_save is None or file_path_save=='':
+            raise ValueError("file_path_save must be defined when save_xas_to_hdf5 is True.")
+        if not isinstance(ds, xr.Dataset):
+                raise ValueError("ds must be an xarray.Dataset.")
+            
+        ds.to_netcdf(file_path_save, engine='h5netcdf')
+        print(f"Dataset saved to {file_path_save} successfully.")
+               
+class XAS_Spectra:
+    def __init__(self, ds=None, filepath=None, file_list=None, order_by_parameter=None):
+        """
+        Initialize an XAS_Spectra object.
+
+        Parameters
+        ----------
+        ds : xarray.Dataset, optional
+            An xarray Dataset containing the XAS data.
+        filepath : str, optional
+            The file path to the XAS data.
+        file_list : list of str, optional
+            A list of file paths to the XAS data files.
+        order_by_parameter : str, optional
+            The parameter by which to order the dataset's DataArrays. 
+            This should be an attribute present in the DataArrays.
+        """
+
+        if sum(x is not None for x in [ds, filepath, file_list]) > 1:
+            raise ValueError("Only one of ds, filepath, or file_list should be provided.")
+        
+        if ds is not None:
+            if not isinstance(ds, xr.Dataset):
+                raise ValueError("data must be an xarray.Dataset")
+            self.ds = ds
+        elif filepath is not None:
+            self.filepath = filepath
+            self._load()
+        elif file_list is not None:
+            if not isinstance(file_list, list):
+                raise ValueError("file_list must be a list of file paths.")
+            if not all(isinstance(f, str) for f in file_list):
+                raise ValueError("All elements in file_list must be strings representing file paths.")
+            if not all(os.path.isfile(f) for f in file_list):
+                for i, f in enumerate(file_list):
+                    if not os.path.isfile(f):
+                        print(f"Invalid file path for file #{i+1}: {f}")
+                raise ValueError("All elements in file_list must be valid file paths.")
+            if order_by_parameter is None:
+                raise ValueError("order_by_parameter must be provided when file_list is used.")
+                
+            self._package_spectra(file_list, order_by_parameter)
+            print("Packaging all the spectra into a single file.")
+        else:
+            raise ValueError("Either data or filepath or file_list must be provided.")
+
+    def _load(self):
+        """
+        Load the HDF5 file into an xarray.Dataset.
+        """
+        if not hasattr(self, "filepath"):
+            raise ValueError("No filepath specified for loading.")
+        self.ds = xr.open_dataset(self.filepath, engine="h5netcdf")
+        return self.ds
+
+    def _package_spectra(self, filelist, order_by_parameter=None):
+        """
+        Package all the spectra into a single xarray.Dataset.
+        Parameters
+        ----------
+        filelist : list of str
+            List of file paths to the HDF5 files to be packaged.
+        """
+        if not isinstance(filelist, list):
+            raise ValueError("filelist must be a list of file paths.")
+        if not all(isinstance(f, str) for f in filelist):
+            raise ValueError("All elements in filelist must be strings representing file paths.")
+        if not all(os.path.isfile(f) for f in filelist):
+            for i, f in enumerate(filelist):
+                if not os.path.isfile(f):
+                    print(f"Invalid file path for file #{i+1}: {f}")
+            raise ValueError("All elements in filelist must be valid file paths.")
+        # Load each file and concatenate them into a single xarray.Dataset
+        self.ds = xr.Dataset()
+        for ii, filepath in enumerate(filelist):
+            ds_now = xr.open_dataset(filepath, engine="h5netcdf")
+            if len(ds_now.data_vars) > 1:
+                print(f"Warning: More than one xrArray found in {filepath}.")
+            for var in ds_now.data_vars:
+                self.ds[str(ii)] = ds_now[var].copy(deep=True)
+        
+        if order_by_parameter is not None:
+            self._order_by_parameter(order_by_parameter)
+            print(f"Ordered dataset by parameter: {order_by_parameter}")
+
+    def _order_by_parameter(self, parameter):
+        """
+        Order the dataset's DataArrays by a specified attribute.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+
+        # Collect (scan_name, attribute_value) pairs
+        scan_attr_pairs = []
+        for scan in self.ds.data_vars:
+            attr_value = self.ds[scan].attrs.get(parameter)
+            if attr_value is None:
+                raise ValueError(f"Parameter '{parameter}' to order dataset not found in attributes of scan '{scan}'.")
+            scan_attr_pairs.append((scan, attr_value))
+
+        # Sort by attribute value
+        scan_attr_pairs.sort(key=lambda x: x[1])
+
+        # Rebuild the dataset in the new order
+        new_ds = xr.Dataset()
+        for scan, _ in scan_attr_pairs:
+            new_ds[scan] = self.ds[scan].copy(deep=True)
+        self.ds = new_ds
+
+    def save_to_hdf5(self, filename):
+        """
+        Save the xarray.Dataset to an HDF5 file with motor values as attributes.
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            The dataset to save.
+        filename : str
+            The name of the HDF5 file to save the dataset to.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        
+        self.ds.to_netcdf(filename, engine='h5netcdf')
+        print(f"Dataset saved to {filename}")
+
+    def save_to_csv(self, filename, motor_names, motor_name_mapping,
+                                  metadata_in_csv=['theta','2theta','phi','energy','polarization',
+                                                      'sample','B [T]', 'T [K]',],
+                                    save_normalized=True):
+        """
+        Save the xarray.Dataset to a CSV file with columns 'Energy Loss (eV)', 'Intensity (arb. units)', and 'Error (arb. units)'.
+        Include a header with the values of the specified motor parameters.
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            The dataset to save.
+        filename : str
+            The name of the CSV file to save the dataset to.
+        motor_names : list of str
+            List of motor names to include in the header.
+        motor_name_mapping : dict
+            Dictionary mapping motor names in the dataset to motor names expected by OriginLab.
+        metadata_in_csv : list of str
+            List of metadata attributes to include in the csv file header.
+        normalize_spectra : bool
+            If True, normalize the spectra by the normalization dataset.
+        divide_normalization_by_value : float
+            Value to divide the normalization dataset by when normalizing the spectra (e.g. 1E6 for mirror at ESRF)
+        positive_energy_loss : bool
+            If True, set the direction of energy loss to positive. If False, set it to negative.
+        """
+
+        # Ensure the filename ends with ".csv"
+        if not filename.lower().endswith('.csv'):
+            base, ext = os.path.splitext(os.path.basename(filename))
+            if ext.lower() != '.csv':
+                print(f"Warning: Changing file extension to .csv for {filename}")
+                filename = os.path.join(os.path.dirname(filename), base + '.csv')
+            filename += '.csv'
+
+        print(f"Saving XAS spectra to csv.\n")
+        with open(filename, 'w', encoding='utf-8') as file:
+
+            # Write the header with motor values
+            # Collect motor values for all scans
+            motor_values_all_scans = {motor: [] for motor in motor_names}
+            for scan in self.ds.data_vars:
+                for motor in motor_names:
+                    if motor in self.ds[scan].attrs:
+                        motor_values_all_scans[motor].append(self.ds[scan].attrs[motor])
+                    else:
+                        motor_values_all_scans[motor].append("")
+
+
+            header = ''
+            # Write motor values in the header
+            for metadata in metadata_in_csv:
+                header_parts = [metadata]
+                header_parts_1 = [' ' for _ in range(len(self.ds.data_vars))]
+                header_parts_2 = []   
+                           
+                if metadata in motor_name_mapping:
+                    if motor_name_mapping[metadata] is not None:
+                        header_parts_2 += [(f"{value:.2f}" if isinstance(value, (int, float)) else str(value))
+                            for i, value in enumerate(motor_values_all_scans[motor_name_mapping[metadata]])
+                        ]
+                else:
+                    header_parts_2 += [" "] * (len(self.ds.data_vars))
+
+                for idx in range(1, len(self.ds.data_vars) * 2 + 1):
+                    if idx % 2 == 1:
+                        header_parts.append(header_parts_1[(idx - 1) // 2])
+                    else:
+                        header_parts.append(header_parts_2[(idx - 1) // 2])
+
+                header += ','.join(header_parts)  # Repeat each motor value twice
+                header += '\n'
+
+            # Write a line of "Energy Loss" and {scan} alternating
+            header += ' ,'+','.join([f"Energy,{scan}" for scan in self.ds.data_vars])
+            header += '\n'
+            units = ' ,'+','.join(['(eV),(arb. units)'] * len(self.ds.data_vars))
+            units += '\n'
+            header += units
+            file.write(f"{header}\n")
+
+            # Create a DataFrame to store all scans
+            data_frames = []
+            # Stack all x and y values as adjacent columns
+            all_data = []
+            for scan in self.ds.data_vars:
+                x_values = self.ds[scan].sel(variable='energy').values
+                if save_normalized:
+                    # Use the normalized xas values
+                    y_values = self.ds[scan].sel(variable='xas_norm').values
+                else:
+                    y_values = self.ds[scan].sel(variable='xas').values
+
+                all_data.append(np.column_stack((x_values, y_values)))
+
+            # Concatenate all data along the second axis
+            concatenated_data = np.concatenate(all_data, axis=1)
+
+            # Write the concatenated data to the file
+            for row in concatenated_data:
+                file.write(' ,'+','.join(map(str, row)) + '\n')
+
+        print(f"Dataset saved to {filename}")
+
+
+    def save_to_txt(self, filename, save_avg_spectrum=False):
+        """
+        Save the xarray.Dataset to a text file with just the datasets
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            The dataset to save.
+        filename : str
+            The name of the text file to save the dataset to.
+        save_avg_spectrum : bool
+            If True, save only the average spectrum as a single 'x' and 'y'
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        
+        if save_avg_spectrum:
+            # Sum all the RIXS spectra and save a single 'x' and 'y'
+            sum_spectrum = np.sum([self.ds[scan].sel(variable='xas_norm').values for scan in self.ds.data_vars], axis=0)
+            sum_norm = np.sum([self.ds[scan].sel(variable='norm').values for scan in self.ds.data_vars], axis=0)
+            avg_spectrum = sum_spectrum / sum_norm
+            x_values = self.ds[list(self.ds.data_vars)[0]].sel(variable='energy').values
+            # Write the data directly to the file
+            np.savetxt(filename, np.concatenate([x_values, avg_spectrum]), delimiter=',', fmt='%.6f, %.6f')
+            print(f"Dataset with only average spectrum saved to {filename}")
+        else:
+            # Create a DataFrame to store all scans
+            data_frames = []
+            # Stack all x and y values as adjacent columns
+            all_data = []
+            for scan in self.ds.data_vars:
+                x_values = self.ds[scan].sel(variable='x').values
+                y_values = self.ds[scan].sel(variable='y').values
+                all_data.append(np.column_stack((x_values, y_values)))
+
+            # Concatenate all data along the second axis
+            concatenated_data = np.concatenate(all_data, axis=1)
+
+            # Write the concatenated data to the file using numpy's savetxt
+            np.savetxt(filename, concatenated_data, delimiter=' ', fmt='%.6f')
+            print(f"Dataset saved to {filename}")
+
+    def print_attributes(self, avoid=None):
+        """
+        Print the attributes of the xarray.Dataset.
+        Parameters
+        ----------
+        avoid : list of str, optional
+            List of attribute names to avoid printing (e.g., 'filename', 'scan', 'run').
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        
+        for scan in self.ds.data_vars:
+            print(f"Scan: {scan}")
+            for attr, value in self.ds[scan].attrs.items():
+                if avoid is not None and attr in avoid:
+                    continue
+                print(f"  {attr}: {value}", end=", ")
+            print("\n")
+
+    def print_attributes_table(self,
+                               attributes_to_include=None,
+                               attributes_to_exclude=None):
+        """
+        Print a table of attributes for each DataArray in the dataset.
+        Rows: attribute names (union of all attributes across DataArrays)
+        Columns: DataArray names
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
     
-    
-class esrf_run_spectrum:
+        if attributes_to_include is not None and not isinstance(attributes_to_include, list):
+            raise ValueError("attributes_to_include must be a list of attribute names.")
+        if attributes_to_exclude is not None and not isinstance(attributes_to_exclude, list):
+            raise ValueError("attributes_to_exclude must be a list of attribute names.")
+        if attributes_to_include is not None and attributes_to_exclude is not None:
+            raise ValueError("Cannot specify both attributes_to_include and attributes_to_exclude.")
+
+        # Collect all attribute names
+        attr_names = set()
+        for var in self.ds.data_vars:
+            attr_names.update(self.ds[var].attrs.keys())
+        attr_names = sorted(attr_names)
+        if attributes_to_include is not None:
+            # Filter attributes to include only those specified
+            attr_names = [attr for attr in attr_names if attr in attributes_to_include]
+        elif attributes_to_exclude is not None:
+            # Filter attributes to exclude those specified
+            attr_names = [attr for attr in attr_names if attr not in attributes_to_exclude]
+
+
+        # Build a dictionary for DataFrame construction
+        data = {}
+        for var in self.ds.data_vars:
+            data[var] = {attr: self.ds[var].attrs.get(attr, "") for attr in attr_names}
+
+        # Create DataFrame and display
+        df = pd.DataFrame(data, index=attr_names)
+        df = df.drop(index=["filename", "scan"], errors="ignore")
+        display(df)
+
+
+
+class ESRF_run_spectrum:
 
     def __init__(self, folder, runs, scans):
         """
@@ -383,12 +1024,13 @@ class esrf_run_spectrum:
             raise FileNotFoundError(f"The folder {folder} does not exist.")
         
         self.folder = folder
-        print(f"Folder found: {folder}")
+        print(f"\n\nFolder found: {folder}")
         self.runs = runs if isinstance(runs, list) else [runs]
         # Check for duplicates in runs
         if len(self.runs) != len(set(self.runs)):
             raise ValueError("Duplicate run numbers found in the provided runs.")
         self.scans = scans
+        self.energy_axis_calculated = False
     
 
     def extract_and_process_spectra(self,
@@ -396,6 +1038,7 @@ class esrf_run_spectrum:
                         y_name,
                         norm_name, 
                         motor_names,
+                        sample_name = '',
                         align_spectra=False,
                         pixel_row_start=None,
                         pixel_row_stop=None,
@@ -408,37 +1051,6 @@ class esrf_run_spectrum:
                         scans_from_same_run=False):
         """
         Process the extracted spectra to align energy shifts and calculate average spectrum.
-        Parameters
-        ----------
-        x_name : str
-            Name of the x-axis variable.
-        y_name : str
-            Name of the y-axis variable.
-        norm_name : str
-            Name of the normalization variable.
-        motor_names : list
-            List of motor names to be included in the extraction.
-        align_spectra : bool, optional
-            Whether to align the spectra. Default is False.
-        pixel_row_start : int, optional
-            Starting pixel row for the correlation region (typically near elastic line). Default is None.
-        pixel_row_stop : int, optional
-            Ending pixel row for the correlation region (typically near elastic line). Default is None.
-        fit_shifts : bool, optional
-            Whether to fit the shifts. Default is False.
-        smooth_shifts : bool, optional
-            Whether to smooth the shifts. Default is False.
-        correlation_batch_size : int, optional
-            Size of the batch for correlation. Default is 10.
-        poly_order : int, optional
-            Polynomial order for fitting shifts. Default is 1.
-        elastic_line_point : float, optional
-            Point to set the elastic line. Default is None.
-        plot : bool, optional
-            Whether to plot the spectra. Default is False.
-        scans_from_same_run : bool, optional
-            Whether the name first line of each scan/run contains the "scan" number, 
-            like in the new ESRF spec files. Default is False, like in the old ones.
         """
 
         if not hasattr(self, 'spectra_xarray'):
@@ -453,24 +1065,34 @@ class esrf_run_spectrum:
         avg_spectrum = np.mean(all_y_data, axis=0)
         # Find aligning range using the _find_aligning_range method
         if pixel_row_start is None or pixel_row_stop is None:
-            pixel_row_start, pixel_row_stop = self._find_aligning_range(x_data,avg_spectrum, threshold=0.1)
+            self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(x_data,avg_spectrum, threshold=0.1)
+        else:
+            self.pixel_row_start = pixel_row_start
+            self.pixel_row_stop = pixel_row_stop
 
         if np.shape(all_y_data)[0] == 1:
             align_spectra = False
 
+        #save the pixel_row_start, pixel_row_stop and sample name inside the spectra_xarrays
+        for spec_name in self.spectra_xarray.data_vars:
+            self.spectra_xarray[spec_name].attrs['pixel_row_start'] = self.pixel_row_start
+            self.spectra_xarray[spec_name].attrs['pixel_row_stop'] = self.pixel_row_stop
+            self.spectra_xarray[spec_name].attrs['sample_name'] = sample_name if sample_name else 'unknown'
+
         if align_spectra:
             ### correct the energy shifts
             _ = self._correct_shift(all_y_data, 
-                                    pixel_row_start, pixel_row_stop, 
+                                    self.pixel_row_start, self.pixel_row_stop, 
                                     fit_shifts=fit_shifts, 
                                     smooth_shifts=smooth_shifts,
                                     correlation_batch_size=correlation_batch_size, 
                                     poly_order=poly_order)
+        
             
-        _ = self.set_elastic_energy(elastic_line_point=elastic_line_point)
+        # _ = self.set_elastic_energy(elastic_line_point=elastic_line_point)
         
         if plot:
-            self.plot_spectra(align_spectra, pixel_row_start=pixel_row_start, pixel_row_stop=pixel_row_stop)
+            self.plot_spectra(align_spectra, pixel_row_start=self.pixel_row_start, pixel_row_stop=self.pixel_row_stop)
 
 
     def _search_runs(self, runs):
@@ -492,7 +1114,7 @@ class esrf_run_spectrum:
             runs = sorted(runs)
 
             # Format run numbers to 4 digits
-            formatted_runs = [f"{int(run):02d}" for run in runs]
+            formatted_runs = [f"{int(run):04d}" for run in runs]
 
             # Get all .spec files in directory
             files = sorted(
@@ -564,23 +1186,42 @@ class esrf_run_spectrum:
         return self.spectra_xarray
 
 
-    def save_to_hdf5(self, file_path_save):
+    def save_to_hdf5(self, file_path_save, 
+                     save_avg_spectrum=False):
         """
         Save the spectra to an HDF5 file.
         """
         if file_path_save is None:
             raise ValueError("file_path_save must be defined when save_to_hdf5 is True.")
-        SpecFile(ds=self.spectra_xarray).save_to_hdf5(file_path_save)
+        if save_avg_spectrum:
+            if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
+                ds_avg = self.calculate_average_spectrum()
+                RIXS_spectra(ds=ds_avg).save_to_hdf5(file_path_save)
+            else:
+                RIXS_spectra(ds=self.avg_spectrum_xr_dataset).save_to_hdf5(file_path_save)
+            print("Only the average spectrum was saved to the HDF5 file.")
+        else:
+            RIXS_spectra(ds=self.spectra_xarray).save_to_hdf5(file_path_save)
+            
 
     def save_to_csv_for_originlab(self, 
                     file_path_save,
-                    motor_names, motor_name_mapping):
+                    motor_names, motor_name_mapping,
+                    save_avg_spectrum=False):
         """
         Save the spectra to a CSV file.
         """
         if file_path_save is None:
             raise ValueError("file_path_save must be defined when save_to_csv is True.")
-        SpecFile(ds=self.spectra_xarray).save_to_csv_for_originlab(file_path_save, motor_names, motor_name_mapping)
+        if save_avg_spectrum:
+            if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
+                ds_avg = self.calculate_average_spectrum()
+                RIXS_spectra(ds=ds_avg).save_to_csv_for_originlab(file_path_save, motor_names, motor_name_mapping)
+            else:
+                RIXS_spectra(ds=self.avg_spectrum_xr_dataset).save_to_csv_for_originlab(file_path_save, motor_names, motor_name_mapping)
+
+        else:
+            RIXS_spectra(ds=self.spectra_xarray).save_to_csv_for_originlab(file_path_save, motor_names, motor_name_mapping)
 
     def save_to_txt(self, file_path_save, save_avg_spectrum=False):
         """
@@ -588,8 +1229,99 @@ class esrf_run_spectrum:
         """ 
         if file_path_save is None:
             raise ValueError("file_path_save must be defined when save_to_tx is True.")
-        SpecFile(ds=self.spectra_xarray).save_to_txt(file_path_save, save_avg_spectrum=save_avg_spectrum)
+        if save_avg_spectrum:
+            ds_avg = self.calculate_average_spectrum()
+            RIXS_spectra(ds=ds_avg).save_to_txt(file_path_save, save_avg_spectrum=save_avg_spectrum)
+        else:
+            RIXS_spectra(ds=self.spectra_xarray).save_to_txt(file_path_save, save_avg_spectrum=save_avg_spectrum)
 
+    def calculate_average_spectrum(self):
+        """
+        Calculate the average spectrum from the extracted spectra.
+        """
+        if not hasattr(self, 'spectra_xarray'):
+            raise ValueError("No spectra have been extracted. Please run extract_1d_runs first.")
+
+        # Calculate the average spectrum
+        runs = []
+        scans = []
+        for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
+            if num_spectrum == 0:
+                avg_spectrum = self.spectra_xarray[spec_name].sel(variable='y').values.copy()
+                x_axis_0 = self.spectra_xarray[spec_name].sel(variable='x').values.copy()
+                norm = self.spectra_xarray[spec_name].sel(variable='norm').values.copy()
+                x_name = self.spectra_xarray[spec_name].attrs.get('x_name', 'x')
+                y_name = self.spectra_xarray[spec_name].attrs.get('y_name', 'y')
+                norm_name = self.spectra_xarray[spec_name].attrs.get('norm_name', 'norm')
+                # Extract only the folder path from the filename
+                filename = os.path.dirname(self.spectra_xarray[spec_name].attrs.get('filename', '?'))
+                date = self.spectra_xarray[spec_name].attrs.get('date', 'date unknown')
+                runs.append(self.spectra_xarray[spec_name].attrs.get('run', '?'))
+                scans.append(self.spectra_xarray[spec_name].attrs.get('scan', '?'))
+                other_attrs = {key: value for key, value in self.spectra_xarray[spec_name].attrs.items() 
+                               if key not in ["x_name", "y_name", "norm_name", "filename", "date", "run", "scan",
+                                              "pixel_row_start", "pixel_row_stop"]}
+
+            else:
+                x_axis = self.spectra_xarray[spec_name].sel(variable='x').values
+                spec_now = self.spectra_xarray[spec_name].sel(variable='y').values
+                interp = np.interp(
+                        x_axis_0, 
+                        x_axis, 
+                        spec_now,
+                        left=0, right=0
+                    )
+            
+                avg_spectrum += interp
+                norm += self.spectra_xarray[spec_name].sel(variable='norm').values
+                runs.append(self.spectra_xarray[spec_name].attrs.get('run', '?'))
+                scans.append(self.spectra_xarray[spec_name].attrs.get('scan', '?'))
+                for key, value in other_attrs.items():
+                    if key in self.spectra_xarray[spec_name].attrs:
+                        current_value = self.spectra_xarray[spec_name].attrs[key]
+                        if isinstance(current_value, (int, float)) and isinstance(value, (int, float)):
+                            # Perform numeric comparison
+                            if abs(current_value - value) > 0.1:
+                                print(f"******Warning******: Attribute '{key}' differs by more than 0.1 between spectra. "
+                                    f"Value in current spectrum: {current_value}, "
+                                    f"Value in other_attrs: {value}")
+                        else:
+                            # Perform string comparison
+                            if str(current_value) != str(value):
+                                print(f"******Warning******: Attribute '{key}' differs between spectra. "
+                                    f"Value in current spectrum: {current_value}, "
+                                    f"Value in other_attrs: {value}")
+
+        # Create the DataArray with multiple coordinates for the 'points' dimension
+        data = np.stack([x_axis_0, avg_spectrum, norm], axis=1)
+        
+        avg_spectrum_xr = xr.DataArray(
+            data=data,
+            dims=['points', 'variable'],
+            coords={
+            'points': np.arange(data.shape[0]),
+            'variable': ['x', 'y', 'norm']
+            }
+        )
+        avg_spectrum_xr.attrs['x_name'] = x_name
+        avg_spectrum_xr.attrs['y_name'] = y_name
+        avg_spectrum_xr.attrs['norm_name'] = norm_name
+        avg_spectrum_xr.attrs['filename'] = filename
+        avg_spectrum_xr.attrs['run'] = runs
+        avg_spectrum_xr.attrs['scan'] = scans
+        avg_spectrum_xr.attrs['date'] = date
+        avg_spectrum_xr.attrs['pixel_row_start'] = self.pixel_row_start
+        avg_spectrum_xr.attrs['pixel_row_stop'] = self.pixel_row_stop
+        
+        # Add other attributes
+        for key, value in other_attrs.items():
+            avg_spectrum_xr.attrs[key] = value
+
+        self.avg_spectrum_xr_dataset = xr.Dataset()
+        self.avg_spectrum_xr_dataset['avg_spectrum'] = avg_spectrum_xr.copy()
+        del avg_spectrum_xr
+
+        return self.avg_spectrum_xr_dataset.copy(deep=True)
 
     def plot_spectra(self, align_spectra=False, pixel_row_start=None, pixel_row_stop=None):
         """
@@ -604,13 +1336,22 @@ class esrf_run_spectrum:
         color_list = [cm.lipari(i) for i in np.linspace(0, 1, len(spectra_to_plot))]
         for i, (spec_name, spec_data) in enumerate(spectra_to_plot):
             plt.plot(spec_data.sel(variable='x'), 
-                    spec_data.sel(variable='y')/spec_data.sel(variable='norm'), label=spec_name, color=color_list[i])
+                    spec_data.sel(variable='y'), label=spec_name, color=color_list[i])
         
         # Plot the average spectrum
-        sum_spectrum = np.sum([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
-        sum_norm = np.sum([self.spectra_xarray[spec].sel(variable='norm').values for spec in self.spectra_xarray.data_vars], axis=0)
-        avg_spectrum = sum_spectrum / sum_norm
-        plt.plot(self.spectra_xarray[spec_name].sel(variable='x'), avg_spectrum, 
+        # sum_spectrum = np.sum([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
+        # sum_norm = np.sum([self.spectra_xarray[spec].sel(variable='norm').values for spec in self.spectra_xarray.data_vars], axis=0)
+        # avg_spectrum = sum_spectrum / sum_norm
+        # plt.plot(self.spectra_xarray[list(self.spectra_xarray.data_vars)[0]].sel(variable='x'), avg_spectrum, 
+        #          label='Average Spectrum', linewidth=2, color='black')
+        # Plot the average spectrum if it does not exist
+        if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
+            ds_avg = self.calculate_average_spectrum()
+        else:
+            ds_avg = self.avg_spectrum_xr_dataset.copy(deep=True)
+
+        avg_spec = ds_avg['avg_spectrum']
+        plt.plot(avg_spec.sel(variable='x'), avg_spec.sel(variable='y')/len(self.spectra_xarray.data_vars), 
                  label='Average Spectrum', linewidth=2, color='black')
         
         # Plot vertical dashed lines for pixel_row_start and pixel_row_stop
@@ -619,10 +1360,10 @@ class esrf_run_spectrum:
             plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_stop], color='k', linestyle='--', label='Stop Pixel Row')
         plt.xlabel('Energy (eV)')
         plt.ylabel('Intensity')
-        plt.legend()
+        # plt.legend()
         plt.title('Extracted Spectra')
         plt.grid()
-        plt.show()
+        # plt.show()
 
         #shifts
         if align_spectra:
@@ -634,7 +1375,7 @@ class esrf_run_spectrum:
             plt.title('Real Shifts of Images')
             plt.grid()
             plt.legend()
-            plt.show()
+            # plt.show()
 
 
     @staticmethod
@@ -679,12 +1420,54 @@ class esrf_run_spectrum:
         # Return the range around the elastic line
         return range_start, range_stop
     
-    def set_elastic_energy(self, elastic_line_point=None):
-        if elastic_line_point is None:
-            raise ValueError("elastic_line_point is not defined. Please set it before calling this method.")
+    def set_elastic_energy(self, auto_elastic_determination=False, elastic_line_point=None, calibration=1):
+        """
+        Set the elastic line energy point and apply calibration to the spectra.
+        Parameters
+        ----------
+        elastic_line_point : float
+            The energy point of the elastic line.
+        calibration : float
+            The calibration factor to be applied to the spectra (in eV/pixel)
+        """
+        if self.energy_axis_calculated:
+            raise ValueError("Energy axis has already been calculated. Skipping...")
+        
+        else:
+            print("-> Setting elastic line energy point and applying calibration...")
+            if elastic_line_point is None and not auto_elastic_determination:
+                raise ValueError("elastic_line_point is not defined and autodetermination is off. Please set it before calling this method.")
+            
+            if auto_elastic_determination:
+                # Automatically determine the elastic line point
+                if self.pixel_row_start is None or self.pixel_row_stop is None:
+                    raise ValueError("pixel_row_start and pixel_row_stop must be defined for automatic determination.")
+                # Find the maximum point in the specified interval
+                self.calculate_average_spectrum()
+                avg_spectrum = self.avg_spectrum_xr_dataset['avg_spectrum'].sel(variable='y').values.copy()
+                x_data = self.avg_spectrum_xr_dataset['avg_spectrum'].sel(variable='x').values.copy()
+                max_index = np.argmax(avg_spectrum[self.pixel_row_start:self.pixel_row_stop]) + self.pixel_row_start
+                
+                # Define a range around the maximum point for center of mass calculation
+                neighbor_range = 1  # Adjust this value as needed
+                start_index = max(max_index - neighbor_range, self.pixel_row_start)
+                end_index = min(max_index + neighbor_range + 1, self.pixel_row_stop)
+                
+                # Calculate the center of mass
+                weights = avg_spectrum[start_index:end_index]
+                indices = np.arange(start_index, end_index)
+                elastic_line_point = np.sum(x_data[indices] * weights) / np.sum(weights)
+                del avg_spectrum
 
-        for spec_name in self.spectra_xarray.data_vars:
-            self.spectra_xarray[spec_name].loc[dict(variable='x')] -= elastic_line_point
+
+            for spec_name in self.spectra_xarray.data_vars:
+                self.spectra_xarray[spec_name].loc[dict(variable='x')] -= elastic_line_point
+                self.spectra_xarray[spec_name].loc[dict(variable='x')] *= calibration
+            
+            self.energy_axis_calculated = True
+            self.calculate_average_spectrum()
+
+            print(f"Elastic line energy point set to {elastic_line_point}, calibration factor {calibration} eV/pixel.")
 
 
     def _correct_shift(self, spectra, pixel_row_start, pixel_row_stop, 
@@ -745,28 +1528,49 @@ class esrf_run_spectrum:
         else:
             self.shifts = np.interp(range(0, spectra.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1]) 
 
-        
+        # Round all the shifts to the nearest integer
+        # self.shifts = np.round(self.shifts)        
          
         # Save the real shifts somewhere for plotting
         for i in range(0, real_shifts.shape[0]):
             self.real_shifts[i * correlation_batch_size:(i + 1) * correlation_batch_size] = real_shifts[i]
 
+        # for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
+        #     if abs(self.shifts[num_spectrum]) > 0.4:
+        #         print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
+                
+        #         # Interpolate
+        #         interp = np.interp(
+        #             np.arange(spectra.shape[1]) - self.shifts[num_spectrum], 
+        #             np.arange(spectra.shape[1]), 
+        #             spectra[num_spectrum, :],
+        #             left=0, right=0
+        #         )
+                
+        #         self.spectra_xarray[spec_name].loc[dict(variable='y')] = interp.copy()
+        #     else:
+        #         self.shifts[num_spectrum] = 0
+        #         print("0.00, ", end="")
+
+        # for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
+        #     # Approximate self.shifts[num_spectrum] to the closest half-integer
+        #     self.shifts[num_spectrum] = round(self.shifts[num_spectrum] * 2) / 2
+
+        #     if abs(self.shifts[num_spectrum]) > 0.1:
+        #         # Interpolate
+        #         interp = np.interp(
+        #             np.arange(spectra.shape[1]) - self.shifts[num_spectrum], 
+        #             np.arange(spectra.shape[1]), 
+        #             spectra[num_spectrum, :],
+        #             left=0, right=0
+        #         )
+            
+        #         self.spectra_xarray[spec_name].loc[dict(variable='y')] = interp.copy()
+
         for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
-            if abs(self.shifts[num_spectrum]) > 0.5:
+            # Approximate self.shifts[num_spectrum] to the closest half-integer            
+                self.spectra_xarray[spec_name].loc[dict(variable='x')] -= self.shifts[num_spectrum]
                 print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
-                
-                # Interpolate
-                interp = np.interp(
-                    np.arange(spectra.shape[1]) - self.shifts[num_spectrum], 
-                    np.arange(spectra.shape[1]), 
-                    spectra[num_spectrum, :],
-                    left=0, right=0
-                )
-                
-                self.spectra_xarray[spec_name].loc[dict(variable='y')] = interp.copy()
-            else:
-                self.shifts[num_spectrum] = 0
-                print("0.00, ", end="")
 
 
         print("")
@@ -797,31 +1601,30 @@ class esrf_run_spectrum:
         if pixel_start < 0 or pixel_stop >= len(spec):
             raise ValueError("pixel_start and pixel_stop must be within the bounds of the spectrum.")
 
-        # if factor == 1:
-        #     # Skip interpolation if factor is 1
-        #     xx = np.arange(pixel_start, pixel_stop + 1)
-        #     xx_extended = np.arange(pixel_start-20, pixel_stop + 1)
-        #     spec = spec[xx]  # Use the original spectrum directly
-        #     spec_ref = spec_ref[xx]  # Use the original reference spectrum directly
-        # else:
-        #     xx = np.arange(pixel_start, pixel_stop + 1 / factor, 1 / factor)
-        #     spec = np.interp(xx, np.arange(0, len(spec)), spec)  # Interpolating the spectrum
-        #     spec_ref = np.interp(xx, np.arange(0, len(spec_ref)), spec_ref)  # Interpolating the reference spectrum
-
-        # crosscorr = correlate(spec/np.mean(spec), spec_ref/np.mean(spec_ref))
-        # lag_values = np.arange(-spec.shape[0] + 1, spec.shape[0], 1)
-        # lag = lag_values[np.argmax(crosscorr)] / factor
-
-        if factor > 1:
-            # xx = np.arange(0, len(spec_ref) + 1 / factor, 1 / factor)
-            xx = np.linspace(0, len(spec_ref)-1, (len(spec_ref) - 1) * factor + 1)
+        if factor == 1:
+            # Skip interpolation if factor is 1
+            xx = np.arange(pixel_start, pixel_stop + 1)
+            spec = spec[xx]  # Use the original spectrum directly
+            spec_ref = spec_ref[xx]  # Use the original reference spectrum directly
+        else:
+            xx = np.arange(pixel_start, pixel_stop + 1 / factor, 1 / factor)
             spec = np.interp(xx, np.arange(0, len(spec)), spec)  # Interpolating the spectrum
             spec_ref = np.interp(xx, np.arange(0, len(spec_ref)), spec_ref)  # Interpolating the reference spectrum
 
-        lag_values, crosscorr = self._custom_cross_correlation(spec, spec_ref, int(pixel_start*factor), int(pixel_stop*factor))
-        crosscorr_restricted = crosscorr[(lag_values >= -10) & (lag_values <= 10)]
-        first_index = np.argmax(lag_values >= -10)
-        lag = (lag_values[np.argmax(crosscorr_restricted)] + first_index) / factor
+        crosscorr = correlate(spec/np.mean(spec), spec_ref/np.mean(spec_ref))
+        lag_values = np.arange(-spec.shape[0] + 1, spec.shape[0], 1)
+        lag = lag_values[np.argmax(crosscorr)] / factor
+
+        # if factor > 1:
+        #     # xx = np.arange(0, len(spec_ref) + 1 / factor, 1 / factor)
+        #     xx = np.linspace(0, len(spec_ref)-1, (len(spec_ref) - 1) * factor + 1)
+        #     spec = np.interp(xx, np.arange(0, len(spec)), spec)  # Interpolating the spectrum
+        #     spec_ref = np.interp(xx, np.arange(0, len(spec_ref)), spec_ref)  # Interpolating the reference spectrum
+
+        # lag_values, crosscorr = self._custom_cross_correlation(spec, spec_ref, int(pixel_start*factor), int(pixel_stop*factor))
+        # crosscorr_restricted = crosscorr[(lag_values >= -10) & (lag_values <= 10)]
+        # first_index = np.argmax(lag_values >= -10)
+        # lag = (lag_values[np.argmax(crosscorr_restricted)] + first_index) / factor
 
         return lag
 
@@ -1021,6 +1824,8 @@ class SpecFile:
                     }
                 )
             ds[f'scan_{scan}'].attrs.update({name: value for name, value in zip(motname_all_scans[i], motval_all_scans[i])})
+            ds[f'scan_{scan}'].attrs['scan'] = scan
+        
         
         ds.attrs['date'] = date
         return ds
@@ -1078,12 +1883,317 @@ class SpecFile:
                 if motor_names:
                     for motor, value in zip(motor_names, motor_values):
                         normalized_data[scan].attrs[motor] = value
+                    if 'hu70cp' in motor_names and 'hu70ap' in motor_names:
+                        normalized_data[scan].attrs['polarization'] = self._determine_polarization(
+                            normalized_data[scan].attrs['hu70ap'], 
+                            normalized_data[scan].attrs['hu70cp']
+                        )
 
                 normalized_data[scan].attrs['date'] = ds.attrs['date']
-                normalized_data[scan].attrs['filename'] = self.run
+                normalized_data[scan].attrs['run'] = self.run
+                normalized_data[scan].attrs['scan'] = ds[scan].attrs['scan']
+                normalized_data[scan].attrs['filename'] = self.filename
         
         return normalized_data
+    
+    @staticmethod
+    def _determine_polarization(hu70ap, hu70cp):
+        
+        # Determine polarization based on motor positions
+        if hu70cp > 30 and hu70ap > 30:
+            polarization = 'LV'
+        elif -2 < hu70cp < 2 and -2 < hu70ap < 2:
+            polarization = 'LH'
+        elif 2 <= hu70cp <= 30 and 2 <= hu70ap <= 30:
+            polarization = 'C+'
+        elif -30 <= hu70cp <= -2 and -30 <= hu70ap <= -2:
+            polarization = 'C-'
+        else:
+            polarization = 'Unknown'
+        
+        return polarization
 
+
+class RIXS_spectra:
+    def __init__(self, ds=None, filepath=None, file_list=None,
+                 order_by_parameter=None):
+        """
+        Initialize RIXS_spectra with either an xarray.Dataset or a file path to an HDF5 file.
+
+        Parameters
+        ----------
+        data : xarray.Dataset, optional
+            The dataset to use directly.
+        filepath : str, optional
+            Path to the HDF5 file to load.
+        """
+        self.ds = None
+        if ds is not None:
+            if not isinstance(ds, xr.Dataset):
+                raise ValueError("data must be an xarray.Dataset")
+            self.ds = ds
+        elif filepath is not None:
+            self.filepath = filepath
+            self._load()
+        elif file_list is not None:
+            self._package_spectra(file_list, order_by_parameter)
+            print("Packaging all the spectra into a single file.")
+        else:
+            raise ValueError("Either data or filepath must be provided.")
+
+    def _load(self):
+        """
+        Load the HDF5 file into an xarray.Dataset.
+        """
+        if not hasattr(self, "filepath"):
+            raise ValueError("No filepath specified for loading.")
+        self.ds = xr.open_dataset(self.filepath, engine="h5netcdf")
+        return self.ds
+
+    def _package_spectra(self, filelist, order_by_parameter=None):
+        """
+        Package all the spectra into a single xarray.Dataset.
+        Parameters
+        ----------
+        filelist : list of str
+            List of file paths to the HDF5 files to be packaged.
+        """
+        if not isinstance(filelist, list):
+            raise ValueError("filelist must be a list of file paths.")
+        if not all(isinstance(f, str) for f in filelist):
+            raise ValueError("All elements in filelist must be strings representing file paths.")
+        if not all(os.path.isfile(f) for f in filelist):
+            for i, f in enumerate(filelist):
+                if not os.path.isfile(f):
+                    print(f"Invalid file path for file #{i+1}: {f}")
+            raise ValueError("All elements in filelist must be valid file paths.")
+        # Load each file and concatenate them into a single xarray.Dataset
+        self.ds = xr.Dataset()
+        for ii, filepath in enumerate(filelist):
+            ds_now = xr.open_dataset(filepath, engine="h5netcdf")
+            if len(ds_now.data_vars) > 1:
+                print(f"Warning: More than one xrArray found in {filepath}.")
+            for var in ds_now.data_vars:
+                self.ds[str(ii)] = ds_now[var].copy(deep=True)
+        
+        if order_by_parameter is not None:
+            self._order_by_parameter(order_by_parameter)
+            print(f"Ordered dataset by parameter: {order_by_parameter}")
+
+    def _order_by_parameter(self, parameter):
+        """
+        Order the dataset's DataArrays by a specified attribute.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+
+        # Collect (scan_name, attribute_value) pairs
+        scan_attr_pairs = []
+        for scan in self.ds.data_vars:
+            attr_value = self.ds[scan].attrs.get(parameter)
+            if attr_value is None:
+                raise ValueError(f"Parameter '{parameter}' to order dataset not found in attributes of scan '{scan}'.")
+            scan_attr_pairs.append((scan, attr_value))
+
+        # Sort by attribute value
+        scan_attr_pairs.sort(key=lambda x: x[1])
+
+        # Rebuild the dataset in the new order
+        new_ds = xr.Dataset()
+        for scan, _ in scan_attr_pairs:
+            new_ds[scan] = self.ds[scan].copy(deep=True)
+        self.ds = new_ds
+
+    def align_spectra(self, method, **kwargs):
+        """
+        Align the spectra in the dataset using the specified method.
+        Parameters
+        ----------
+        method : str
+            The alignment method to use. Options are 'cross-correlation' or 'fitting'.
+        **kwargs : dict
+            Additional parameters for the alignment method, such as 'resolution', 'fit_function', and 'plot'.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        if method == 'cross-correlation':
+            # Implement correlation-based alignment
+            self._align_spectra_cross_correlation()
+        elif method == 'fitting':
+            # fitting alignment
+            resolution = kwargs.get('resolution', 0.1)
+            fit_function = kwargs.get('fit_function', 'gaussian')
+            plot = kwargs.get('plot', False)
+            self._align_spectra_fitting(resolution=resolution, fit_function=fit_function, plot=plot) 
+        else:
+            raise ValueError(f"Unknown alignment method: {method}")
+    
+    def _align_spectra_cross_correlation(self):
+        """
+        Align the spectra in the dataset using cross-correlation.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        # Implement cross-correlation alignment logic here
+        pass
+
+    def _align_spectra_fitting(self, resolution=0.1, fit_function="gaussian",
+                               plot=False):
+        """
+        Align the spectra in the dataset using fitting of elastic line.
+        Parameters
+        ----------
+        resolution : float
+            The resolution of the fitting function in eV.
+        fit_function : str
+            The type of fitting function to use. Options are 'gaussian' or 'pseudovoigt'.
+        plot : bool
+            If True, plot the fitting results.
+        Raises
+        ------
+        ValueError
+            If the dataset is not provided.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        
+        # Define normalization limits and fit limits
+        fit_min = -resolution * 3
+        fit_max = resolution/2.5
+
+        # Define gaussian and pseudovoigt functions
+        def gaussian(x, amp, cen, fwhm):
+            sigma = fwhm/(2*np.sqrt(2*np.log(2)))
+            return amp * np.exp(-0.5 * ((x - cen) / sigma) ** 2)
+
+        def pseudovoigt(x, amp, cen, fwhm, eta):
+            # eta: mixing parameter (0=Gaussian, 1=Lorentzian)
+            gaussian_part = (1 - eta) * amp * np.exp(-4 * np.log(2) * ((x - cen) / fwhm) ** 2)
+            lorentzian_part = eta * amp / (1 + 4 * ((x - cen) / fwhm) ** 2)
+            return gaussian_part + lorentzian_part
+        
+        if fit_function=="gaussian":
+            p0 = [1.0, 0.0]
+            bounds = ([0, -np.inf], [np.inf, np.inf])
+            def fitting_func(x, amp, cen):
+                return gaussian(x, amp, cen, resolution)
+        elif fit_function=="pseudovoigt":
+            p0 = [1.0, 0.0, 0.2]
+            bounds = ([0, -np.inf, 0], [np.inf, np.inf, 1])
+            def fitting_func(x, amp, cen, eta):
+                return pseudovoigt(x, amp, cen, resolution, eta)
+        else:
+            raise ValueError(f"Unknown fit function: {fit_function}")
+
+        # Implement fitting alignment logic here
+        # For each xArray in self.ds, extract x_values and y_values
+        for scan in self.ds.data_vars:
+            x_values = self.ds[scan].sel(variable='x').values
+            y_values = self.ds[scan].sel(variable='y').values
+            norm_values = self.ds[scan].sel(variable='norm').values
+            x_values, y_values, norm_values, direction_changed = self._set_direction_energy_loss(x_values, y_values,
+                                                                              norm_values=norm_values,
+                                                                               positive_energy_loss=True)
+
+            # Find indices within the normalization range
+            norm_indices = np.where((x_values >= fit_min) & (x_values <= fit_max))[0]
+            if len(norm_indices) == 0:
+                raise ValueError(f"No data points found in normalization range for scan {scan}.")
+
+            # Normalize y_values to the max value within the range
+            max_val = np.max(y_values[norm_indices])
+            if max_val == 0:
+                normed_y = y_values
+            else:
+                normed_y = y_values / max_val
+
+            # Fit the data using the specified fitting function
+            # Fit only in the normalization range
+            x_fit = x_values[norm_indices]
+            y_fit = normed_y[norm_indices]
+
+            # Perform the fit using curve_fit
+            try:
+                popt, pcov = curve_fit(fitting_func, x_fit, y_fit, p0=p0, bounds=bounds)
+                initialfit = fitting_func(x_values, *popt)
+            except Exception as e:
+                print(f"Fit failed for scan {scan}: {e}")
+                popt = None
+                initialfit = np.full_like(x_values, np.nan)
+
+            shift = popt[1]  # center position from fit
+            x_values_shifted = x_values - shift
+            # Update the x_values in the dataset
+            self.ds[scan].loc[dict(variable='x')] = x_values_shifted if not direction_changed else -x_values_shifted[::-1]
+            self.ds[scan].loc[dict(variable='y')] = y_values if not direction_changed else y_values[::-1]
+            self.ds[scan].loc[dict(variable='norm')] = norm_values if not direction_changed else norm_values[::-1]
+
+            if plot:
+                plt.figure(figsize=(4, 4))
+                plt.plot(x_values, normed_y, label='Original Data')
+                plt.plot(x_fit, y_fit, 'o', label='Data for Fit')
+                plt.plot(x_values, initialfit, label='Fitted Curve', color='red')
+                plt.title(f"Scan {scan} - Shift: {shift:.2f}")
+                plt.xlim(-resolution*3, resolution*3)
+                plt.xlabel('Energy Loss (eV)')
+                plt.ylabel('Intensity (arb. units)')
+                plt.legend()
+                plt.show()
+
+    def set_direction_energy_loss_dataset(self, positive_energy_loss=True):
+        """
+        Set the direction of energy loss for the dataset based on the specified condition.
+
+        Parameters
+        ----------
+        positive_energy_loss : bool
+            If True, set the direction to positive energy loss.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        
+        for scan in self.ds.data_vars:
+            x_values = self.ds[scan].sel(variable='x').values
+            y_values = self.ds[scan].sel(variable='y').values
+            norm_values = self.ds[scan].sel(variable='norm').values
+            x_values, y_values, norm_values, direction_changed = self._set_direction_energy_loss(
+                x_values, y_values, norm_values=norm_values, positive_energy_loss=positive_energy_loss)
+            
+            # Update the xarray with the new values
+            self.ds[scan].loc[dict(variable='x')] = x_values
+            self.ds[scan].loc[dict(variable='y')] = y_values
+            self.ds[scan].loc[dict(variable='norm')] = norm_values
+        
+
+    @staticmethod
+    def _set_direction_energy_loss(x_values, y_values, norm_values = None, positive_energy_loss=True):
+        # Calculate the sum of y_values for x_values < 0 and x_values > 0
+        sum_left = np.sum(y_values[x_values < 0])
+        sum_right = np.sum(y_values[x_values > 0])
+        if sum_left > sum_right and positive_energy_loss:
+            #more intensity at negative energy losses
+            # Multiply x_values by -1 and flip all arrays
+            x_values = -x_values
+            idx = np.argsort(x_values)
+            x_values = x_values[idx]
+            y_values = y_values[idx]
+            norm_values = norm_values[idx] if norm_values is not None else None
+            direction_changed = True
+        elif sum_left < sum_right and not positive_energy_loss:
+            #more intensity at positive energy losses
+            # Multiply x_values by -1 and flip all arrays
+            x_values = -x_values
+            idx = np.argsort(x_values)
+            x_values = x_values[idx]
+            y_values = y_values[idx]
+            norm_values = norm_values[idx] if norm_values is not None else None
+            direction_changed = True
+        else:
+            #no need to change direction
+            direction_changed = False
+
+        return x_values, y_values, norm_values, direction_changed
+    
     def save_to_hdf5(self, filename):
         """
         Save the xarray.Dataset to an HDF5 file with motor values as attributes.
@@ -1106,8 +2216,10 @@ class SpecFile:
 
     def save_to_csv_for_originlab(self, filename, motor_names, motor_name_mapping,
                                   metadata_in_origin=['Q', 'theta','2theta','phi','energy','polarization',
-                                                      'mirror','sample','B [T]', 'T [K]', 'comments'],
-                                  save_avg_spectrum=False):
+                                                      'mirror','sample','B [T]', 'T [K]',],
+                                    normalize_spectra=False,
+                                    divide_normalization_by_value=1,
+                                    positive_energy_loss=True,):
         """
         Save the xarray.Dataset to a CSV file with columns 'Energy Loss (eV)', 'Intensity (arb. units)', and 'Error (arb. units)'.
         Include a header with the values of the specified motor parameters.
@@ -1122,6 +2234,14 @@ class SpecFile:
             List of motor names to include in the header.
         motor_name_mapping : dict
             Dictionary mapping motor names in the dataset to motor names expected by OriginLab.
+        metadata_in_origin : list of str
+            List of metadata attributes to include in the OriginLab file.
+        normalize_spectra : bool
+            If True, normalize the spectra by the normalization dataset.
+        divide_normalization_by_value : float
+            Value to divide the normalization dataset by when normalizing the spectra (e.g. 1E6 for mirror at ESRF)
+        positive_energy_loss : bool
+            If True, set the direction of energy loss to positive. If False, set it to negative.
         """
 
         # Ensure the filename ends with ".csv"
@@ -1132,6 +2252,7 @@ class SpecFile:
                 filename = os.path.join(os.path.dirname(filename), base + '.csv')
             filename += '.csv'
 
+        print(f"Saving dataset- Spectra will be normalized by {self.ds['0'].attrs['norm_name']}, divided by {divide_normalization_by_value}.\n")
         with open(filename, 'w', encoding='utf-8') as file:
 
             # Write the header with motor values
@@ -1144,54 +2265,86 @@ class SpecFile:
                     else:
                         motor_values_all_scans[motor].append("")
 
+            #### old version
+            # header = ''
+            # # Write motor values in the header
+            # for metadata in metadata_in_origin:
+            #     header_parts = [metadata]
+            #     if metadata == 'mirror':
+            #         header_parts += [f"{np.mean(self.ds[scan].sel(variable='norm').values):.2f}" for scan in self.ds.data_vars]
+            #     else:                
+            #         if metadata in motor_name_mapping:
+            #             if motor_name_mapping[metadata] is not None:
+            #                 header_parts += [
+            #                     f"{value:.2f}" if isinstance(value, (int, float)) else str(value) 
+            #                     for value in motor_values_all_scans[motor_name_mapping[metadata]]
+            #                 ]
+            #         else:
+            #             header_parts += [" "] * len(motor_values_all_scans[motor_names[0]])
+            #     header += ','.join(header_parts * 2)  # Repeat each motor value twice
+            #     header += '\n'
+
             header = ''
             # Write motor values in the header
             for metadata in metadata_in_origin:
                 header_parts = [metadata]
-                if metadata in motor_name_mapping:
-                    if motor_name_mapping[metadata] is not None:
-                        header_parts += [
-                            f"{value:.2f}" for value in motor_values_all_scans[motor_name_mapping[metadata]]
-                        ]
-                else:
-                    header_parts += [" "] * len(motor_values_all_scans[motor_names[0]])
-                header += ','.join(header_parts * 2)  # Repeat each motor value twice
+                header_parts_1 = [' ' for _ in range(len(self.ds.data_vars))]
+                header_parts_2 = []
+                if metadata == 'mirror':
+                        if normalize_spectra:
+                            header_parts_2 += [f"{np.mean(self.ds[scan].sel(variable='norm').values)/divide_normalization_by_value:.2f}" for i, scan in enumerate(self.ds.data_vars)]
+                        else:
+                            header_parts_2 += [f"{np.mean(self.ds[scan].sel(variable='norm').values):.2f}" for i, scan in enumerate(self.ds.data_vars)]
+                else:                
+                    if metadata in motor_name_mapping:
+                        if motor_name_mapping[metadata] is not None:
+                            header_parts_2 += [(f"{value:.2f}" if isinstance(value, (int, float)) else str(value))
+                                for i, value in enumerate(motor_values_all_scans[motor_name_mapping[metadata]])
+                            ]
+                    else:
+                        header_parts_2 += [" "] * (len(self.ds.data_vars))
+
+                for idx in range(1, len(self.ds.data_vars) * 2 + 1):
+                    if idx % 2 == 1:
+                        header_parts.append(header_parts_1[(idx - 1) // 2])
+                    else:
+                        header_parts.append(header_parts_2[(idx - 1) // 2])
+
+                header += ','.join(header_parts)  # Repeat each motor value twice
                 header += '\n'
 
             # Write a line of "Energy Loss" and {scan} alternating
-            header += ','.join([f"Energy Loss,{scan}" for scan in self.ds.data_vars])
+            header += ' ,'+','.join([f"Energy Loss,{scan}" for scan in self.ds.data_vars])
             header += '\n'
-            units = ','.join(['(eV),(arb. units)'] * len(self.ds.data_vars))
+            units = ' ,'+','.join(['(eV),(arb. units)'] * len(self.ds.data_vars))
             units += '\n'
             header += units
             file.write(f"{header}\n")
 
-            # Write the column names
-            if save_avg_spectrum:
-                # Sum all the RIXS spectra and save a single 'x' and 'y'
-                sum_spectrum = np.sum([self.ds[scan].sel(variable='y').values for scan in self.ds.data_vars], axis=0)
-                sum_norm = np.sum([self.ds[scan].sel(variable='norm').values for scan in self.ds.data_vars], axis=0)
-                avg_spectrum = sum_spectrum / sum_norm
-                x_values = self.ds[list(self.ds.data_vars)[0]].sel(variable='x').values
-                # Write the data directly to the file
-                for x, y in zip(x_values, avg_spectrum):
-                    file.write(f"{x},{y}\n")
-            else:
-                # Create a DataFrame to store all scans
-                data_frames = []
-                # Stack all x and y values as adjacent columns
-                all_data = []
-                for scan in self.ds.data_vars:
-                    x_values = self.ds[scan].sel(variable='x').values
-                    y_values = self.ds[scan].sel(variable='y').values
-                    all_data.append(np.column_stack((x_values, y_values)))
+            # Create a DataFrame to store all scans
+            data_frames = []
+            # Stack all x and y values as adjacent columns
+            all_data = []
+            for scan in self.ds.data_vars:
+                x_values = self.ds[scan].sel(variable='x').values
+                y_values = self.ds[scan].sel(variable='y').values
+                norm_values = self.ds[scan].sel(variable='norm').values
+                if normalize_spectra:
+                    # Normalize the y-values by the norm values
+                    y_values = y_values / norm_values * divide_normalization_by_value
 
-                # Concatenate all data along the second axis
-                concatenated_data = np.concatenate(all_data, axis=1)
+                # Calculate the sum of y_values for x_values < 0 and x_values > 0
+                x_values, y_values, norm_values,_ = self._set_direction_energy_loss(x_values, y_values,
+                                                                                  norm_values=norm_values,
+                                                                                  positive_energy_loss=positive_energy_loss)
+                all_data.append(np.column_stack((x_values, y_values)))
 
-                # Write the concatenated data to the file
-                for row in concatenated_data:
-                    file.write(','.join(map(str, row)) + '\n')
+            # Concatenate all data along the second axis
+            concatenated_data = np.concatenate(all_data, axis=1)
+
+            # Write the concatenated data to the file
+            for row in concatenated_data:
+                file.write(' ,'+','.join(map(str, row)) + '\n')
 
         print(f"Dataset saved to {filename}")
 
@@ -1235,3 +2388,107 @@ class SpecFile:
             # Write the concatenated data to the file using numpy's savetxt
             np.savetxt(filename, concatenated_data, delimiter=' ', fmt='%.6f')
             print(f"Dataset saved to {filename}")
+
+    def print_attributes(self, avoid=None):
+        """
+        Print the attributes of the xarray.Dataset.
+        Parameters
+        ----------
+        avoid : list of str, optional
+            List of attribute names to avoid printing (e.g., 'filename', 'scan', 'run').
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+        
+        for scan in self.ds.data_vars:
+            print(f"Scan: {scan}")
+            for attr, value in self.ds[scan].attrs.items():
+                if avoid is not None and attr in avoid:
+                    continue
+                print(f"  {attr}: {value}", end=", ")
+            print("\n")
+
+    def print_attributes_table(self):
+        """
+        Print a table of attributes for each DataArray in the dataset.
+        Rows: attribute names (union of all attributes across DataArrays)
+        Columns: DataArray names
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+
+        # Collect all attribute names
+        attr_names = set()
+        for var in self.ds.data_vars:
+            attr_names.update(self.ds[var].attrs.keys())
+        attr_names = sorted(attr_names)
+        attr_names = [attr for attr in attr_names if attr not in ("filename", "scan", "run")]
+
+        # Build a dictionary for DataFrame construction
+        data = {}
+        for var in self.ds.data_vars:
+            data[var] = {attr: self.ds[var].attrs.get(attr, "") for attr in attr_names}
+
+        # Create DataFrame and display
+        df = pd.DataFrame(data, index=attr_names)
+        df = df.drop(index=["filename", "scan"], errors="ignore")
+        display(df)
+
+    def get_map_with_parameter(self, parameter):
+        parameter_list = []
+        y = []
+        x = []
+
+        for da_name in self.ds.data_vars:
+            da = self.ds[da_name]
+            # Extract the "energy" attribute
+            par = da.attrs.get(parameter)
+            parameter_list.append(par)
+
+            # Save the RIXS spectra and corresponding x-axis
+            x_values = self.ds[da_name].sel(variable='x').values
+            y_values = self.ds[da_name].sel(variable='y').values
+            norm_values = self.ds[da_name].sel(variable='norm').values / 1E6
+            y.append(y_values/ norm_values)  # Normalize the y values
+            x.append(x_values)
+
+
+        par_arr = np.array(parameter_list)
+        # Interpolate all y_values onto the first x_values grid
+        x_arr = np.array(x[0])  # use the first x_values as the reference grid
+        y_interp = []
+        for i in range(len(y)):
+            y_interp.append(np.interp(x_arr, x[i], y[i]))
+
+        intensity = np.array(y_interp).T  # shape: (len(x_arr), len(energy_list))
+
+        return x_arr, par_arr, intensity
+        
+
+
+    @staticmethod
+    def _determine_polarization(hu70ap, hu70cp):
+        
+        # Determine polarization based on motor positions
+        if hu70cp > 30 and hu70ap > 30:
+            polarization = 'LV'
+        elif -2 < hu70cp < 2 and -2 < hu70ap < 2:
+            polarization = 'LH'
+        elif 2 <= hu70cp <= 30 and 2 <= hu70ap <= 30:
+            polarization = 'C+'
+        elif -30 <= hu70cp <= -2 and -30 <= hu70ap <= -2:
+            polarization = 'C-'
+        else:
+            polarization = 'Unknown'
+        
+        return polarization
+    
+
+
+def main():
+    print('ciao')   
+
+  
+
+if __name__ == "__main__":
+    main()
