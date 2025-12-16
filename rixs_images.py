@@ -816,6 +816,8 @@ class DLS_Image(RIXS_Image):
                 except:
                     print("WARNING: Could not retrieve normalization factor from NeXus file")
                     self.normalization_factor = 1
+        if isinstance(self.normalization_factor, float):
+            self.normalization_factor = [self.normalization_factor]*self.n_images
 
         return self.normalization_factor
 
@@ -844,6 +846,10 @@ class DLS_Image(RIXS_Image):
                 If True, compute mean before spike removal in dark image
             - index_start_fit_bkg : int
                 Index to start fitting the background
+            - curve_a : float
+                Linear coefficient for curvature correction
+            - curve_b : float
+                Quadratic coefficient for curvature correction
         Returns
         -------
         None
@@ -869,7 +875,7 @@ class DLS_Image(RIXS_Image):
 
         self._fit_bkg_sklearn(index_start_fit_bkg=kwargs.get('index_start_fit_bkg', 1192))
         self._subtract_dark()
-        self._correct_curvature()
+        self._correct_curvature(curve_a=kwargs.get('curve_a', 0), curve_b=kwargs.get('curve_b', 0))
 
         return self.imgs_processed, self.normalization_factor
 
