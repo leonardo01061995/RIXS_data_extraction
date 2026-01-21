@@ -6,6 +6,7 @@ from scipy.signal import fftconvolve
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import correlate
+from scipy.interpolate import RegularGridInterpolator as rgi
 from cmcrameri import cm
 from abc import ABC, abstractmethod
 import fabio
@@ -44,8 +45,8 @@ class RIXS_Raw_Images:
         """
         self.folder = folder
         self.facility = facility
-        if facility not in ["ESRF", "TPS"]:
-            raise ValueError("Facility must be either 'ESRF' or 'TPS'")
+        if facility not in ["ESRF", "TPS", "DLS"]:
+            raise ValueError("Facility must be either 'ESRF' or 'TPS' or 'DLS'")
         self.identifier_string = identifier_string
         self.run_number = sorted(run_number) if isinstance(run_number, list) else run_number
         self.exp_number = exp_number
@@ -198,7 +199,7 @@ class RIXS_Raw_Images:
         return:
         result[-1]: str, the last file found in the directory
         """
-        print(f"Retrieving images for run {self.runNB}.")
+        print(f"Retrieving filenames for run {self.run_number}:")
 
         start_time = time.perf_counter()
         path = self.folder
@@ -225,6 +226,8 @@ class RIXS_Raw_Images:
             if not result:
                 raise FileNotFoundError(f"No files found for the specified run number {number}.")
             
+            for file in result:
+                print(f" - {file}")
             self.file_names = result
 
         return result 
@@ -235,17 +238,16 @@ class RIXS_Raw_Images:
                             extract_curvature = False,
                             spc_parameters = {},
                             no_spc_parameters = {},
-                            calibration = 0,
-                            normalize_images = True,
+                            additional_metadata = {},
                             align_images = True,
                             pixel_row_start=None, pixel_row_stop=None,
                             find_aligning_range=False, 
-                            fit_shifts=False, 
+                            process_shifts='', 
                             correlation_batch_size=1,
                             poly_order=1,
                             align_images_by_shifting_photons=False,
-                            plot_raw_image=False,
-                            keep_2d_images=True):
+                            plot_generation=False,
+                            keep_2d_images=False):
         """
         Process multiple RIXS image files using single photon counting
         
@@ -282,10 +284,6 @@ class RIXS_Raw_Images:
             roi_y_for_dark : tuple of int, optional
                 Region of interest along the y-axis for dark image subtraction, default (250, 1800)
 
-        calibration : float, optional
-            Calibration factor for the energy axis in meV/pixel, default 2.1
-        normalize_images : bool, optional
-            If True, normalize the images using the normalization factor, default True
         align_images : bool, optional
             If True, align images based on cross-correlation, default True
         pixel_row_start : int
@@ -303,21 +301,25 @@ class RIXS_Raw_Images:
             3D array containing processed images stacked along first axis
         """
 
+        if not self.file_names:
+            return
+
         #single photon counting parameters
         self.use_spc = use_spc
-
         self.align_images = align_images
-        self.normalize_images = normalize_images
-        self.calibration = calibration
+        if process_shifts not in ['', 'fit', 'smooth']:
+            raise ValueError("process_shifts must be one of '', 'fit', or 'smooth'.")
+
+        # Check if curvature extraction is disabled and no curve parameters are provided
+        curve_a = spc_parameters.get("curve_a", 0) if use_spc else no_spc_parameters.get("curve_a", 0)
+        curve_b = spc_parameters.get("curve_b", 0) if use_spc else no_spc_parameters.get("curve_b", 0)
+        if not extract_curvature and (curve_a == 0 and curve_b == 0):
+            print("Careful: Curvature extraction is disabled and the given slope is zero")
 
         if not find_aligning_range and (pixel_row_start is None or pixel_row_stop is None):
             raise ValueError("If find_aligning_range is False, both pixel_row_start and pixel_row_stop must be provided.")
-
-        if not self.file_names:
-            return
         
-
-        ds = xr.Dataset()
+        self.ds_1d = xr.Dataset()
         processed_images = []
         # Determine axis names
         y_name = "Photons" if use_spc else "Counts"
@@ -332,6 +334,7 @@ class RIXS_Raw_Images:
              
         print("Performing generation of RIXS spectra from images and curvature correction.")
         start_time = time.perf_counter()
+        raw_imgs = []
         for run_index, filename in enumerate(self.file_names):
             # Create edf_image instance and process
             if self.facility == "ESRF":
@@ -342,12 +345,7 @@ class RIXS_Raw_Images:
                 img = DLS_Image(filename)
             else:
                 raise ValueError("Facility must be either 'ESRF', 'TPS' or 'DLS'")
-
-            # Check if curvature extraction is disabled and no curve parameters are provided
-            curve_a = spc_parameters.get("curve_a", 0) if use_spc else no_spc_parameters.get("curve_a", 0)
-            curve_b = spc_parameters.get("curve_b", 0) if use_spc else no_spc_parameters.get("curve_b", 0)
-            if not extract_curvature and (curve_a == 0 and curve_b == 0):
-                print("Careful: Curvature extraction is disabled and the given slope is zero")
+            
             if extract_curvature:
                 # Call the find_curvature method with appropriate parameters
                 curve_a, curve_b = self._find_curvature(img.raw_data.mean(axis=0), 
@@ -356,79 +354,153 @@ class RIXS_Raw_Images:
                 if use_spc:
                     spc_parameters["curve_a"] = curve_a
                     spc_parameters["curve_b"] = curve_b
+                else:
+                    no_spc_parameters["curve_a"] = curve_a
+
+                    no_spc_parameters["curve_b"] = curve_b
 
             _, _ = img.process_imgs(use_spc=self.use_spc,
                                             spc_parameters=spc_parameters,
-                                            no_spc_parameters=no_spc_parameters)
+                                            no_spc_parameters=no_spc_parameters,
+                                            plot_generation=plot_generation)
+
+            raw_imgs.append(img)
 
             #save each spectrum inside a xarray dataarray. All the spectra from different runs will be saved inside ds xarray dataset
-            for i, rixs_1d in enumerate(img.imgs_processed):
+            for i, rixs_2d in enumerate(img.imgs_processed):
 
                 # Create x, y, norm arrays as 1D vectors
-                x = np.arange(rixs_1d.shape[1])/spc_parameters["subdivide_bins_factor_y"] if use_spc else np.arange(rixs_1d.shape[1])
-                y = rixs_1d.mean(axis=2)
-                norm = np.full_like(x, rixs_1d.normalization_factors[i])
+                x = np.arange(rixs_2d.shape[1])/spc_parameters["subdivide_bins_factor_y"] if use_spc else np.arange(rixs_2d.shape[1])
+                y = rixs_2d.mean(axis=1)
+                norm = np.full_like(x, img.normalization_factor[i])
 
                 # Create DataArray with 1D vectors stacked along axis=1
                 da = xr.DataArray(
                     np.stack([x, y, norm], axis=1),
-                    dims=['pixel', 'variable'],
-                    coords={"feature": ['x', 'y', 'norm']},
-                    attrs={**getattr(img, "attributes", {}),
+                    dims=['points', 'variable'],
+                    coords={"points": np.arange(x.shape[0]),
+                            'variable': ['x', 'y', 'norm']},
+                    attrs={
+                        **getattr(img, "attributes", {}),
+                        **additional_metadata,
                         "x_name": 'Pixel',
                         "y_name": y_name,
                         "norm_name": norm_name,
-                        'run_number': img.run_number,}
+                        'run_number': img.run_number,
+                    }
                 )
-                ds[f"{i}"] = da
+                self.ds_1d[f"{i}"] = da
 
                 #append the 1D processed spectra to the list
                 self.one_d_processed_spectra.append(y)
             
-            self.normalization_factors += img.normalization_factor
+            # img.normalization_factor is an array (one value per sub-image); extend the list with its elements
+            self.normalization_factors.extend(np.asarray(img.normalization_factor).tolist())
             if keep_2d_images or align_images_by_shifting_photons:
                 processed_images.append(img.imgs_processed)
 
+        processed_images = np.stack(processed_images, axis=0)  # Shape: (n_images, n_rows, n_cols)
         self.normalization_factors = np.stack(self.normalization_factors)
         mean_normalization_factor = np.mean(self.normalization_factors)
         std_normalization_factor = np.std(self.normalization_factors)
         print(f"Normalization factor: {mean_normalization_factor} +- {std_normalization_factor}")
-
         print(f"Total elapsed time for spectrum generation: {time.perf_counter() - start_time:.2f} seconds. \n")
-          
-        ########## Alignment, but only for single-photon counting images if wanted
-        if self.align_images and self.all_imgs_processed.shape[0] > 1 and use_spc and align_images_by_shifting_photons: 
-            #correct the shift
+
+        if self.align_images and len(self.one_d_processed_spectra) > 1:
+            print("Calculating energy correlation and aligning images. 2D images will be stored in memory.", end="\n\n")
             if find_aligning_range:
-                self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(threshold=0.1)
+                self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(processed_images, threshold=0.1)
             else:
                 self.pixel_row_start = pixel_row_start
                 self.pixel_row_stop = pixel_row_stop
 
             ###### ONly calculate the shift: then re-bin each image
-            self._calculate_shift(self.pixel_row_start, self.pixel_row_stop, fit_shifts, 
-                            correlation_batch_size, poly_order)
-               
-            ###### now re-bin the images if you used single-photon counting
-            print("Re-binning images with known shifts by vertically shifting photons.")
-            processed_images = []
-            for i,img in enumerate(processed_images):
-                    processed_images.append(img.single_photon_counting(
-                        **spc_parameters,
-                        vertical_shift = self.shifts[i])[0])         
+            self._calculate_shift(self.pixel_row_start, self.pixel_row_stop, process_shifts=process_shifts,
+                            correlation_batch_size=correlation_batch_size, poly_order=poly_order)
 
-        elif self.align_images and img.n_images == 1: 
+            if use_spc and align_images_by_shifting_photons:
+                ###### now re-bin the images if you used single-photon counting
+                print("Re-binning images with known shifts by vertically shifting photons.")
+                for i,img in enumerate(raw_imgs):
+                        processed_images[i,:,:] = img.single_photon_counting(
+                            **spc_parameters,
+                            vertical_shift = self.shifts[i])[0] 
+                # self.all_imgs_processed = np.stack(processed_images, axis=0)
+                        
+            else:
+                print("Shifting images with known shifts by interpolation.")
+                # self.all_imgs_processed = np.zeros((len(processed_images), processed_images[0].shape[0], processed_images[0].shape[1]))
+                for num_image, processed_img in enumerate(processed_images):
+                    if abs(self.shifts[num_image])>0.25: #if the shift is too large, we shift the image
+                        xdim,ydim=processed_img.shape
+                        x=np.arange(xdim)
+                        y=np.arange(ydim)
+                        interp = rgi((x-self.shifts[num_image], y), processed_img, bounds_error=False, fill_value=0)
+
+                        xx,yy=np.meshgrid(x,y)
+                        processed_images[num_image,:,:] = interp((xx,yy)).T #shifting the images
+
+            self.all_imgs_processed = processed_images
+
+
+        elif self.align_images and len(self.one_d_processed_spectra) == 1:
             print("Only one file found. No energy correlation necessary.")
+            self.all_imgs_processed = processed_images
         else:
             print("Aligning images is disabled. No energy correlation will be performed.")
+            if keep_2d_images:
+                # self.ds_2d = xr.Dataset()
+                # #save the imgs from processed_imgs, and the attributes from the rixs_img objects
+                # for ii, (img_2d, img_object) in enumerate(zip(processed_images, raw_imgs)):
+                #     da = xr.DataArray(
+                #         img_2d,
+                #         dims=['points', 'variable'],
+                #         coords={"points": np.arange(x.shape[0]),
+                #                 'variable': ['x', 'y', 'norm']},
+                #         attrs={
+                #             **getattr(img_object, "attributes", {}),
+                #             **additional_metadata,
+                #             "x_name": 'Pixel',
+                #             "y_name": y_name,
+                #             "norm_name": norm_name,
+                #             'run_number': img_object.run_number,
+                #         }
+                #     )
+                #     self.ds_2d[f"{ii}"] = da.copy()
+                self.imgs_imgs_processed = processed_images
+            
 
-        if keep_2d_images:
-            self.all_imgs_processed = np.stack(processed_images, axis=0)
+        #old code for alignment
+        # ########## Alignment, but only for single-photon counting images if wanted
+        # if self.align_images and len(self.one_d_processed_spectra) > 1 and use_spc and align_images_by_shifting_photons: 
+        #     #correct the shift
+        #     if find_aligning_range:
+        #         self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(threshold=0.1)
+        #     else:
+        #         self.pixel_row_start = pixel_row_start
+        #         self.pixel_row_stop = pixel_row_stop
 
-        return Generated_1D_RIXS_Spectra(ds)
+        #     ###### ONly calculate the shift: then re-bin each image
+        #     self._calculate_shift(self.pixel_row_start, self.pixel_row_stop, fit_shifts, 
+        #                     correlation_batch_size, poly_order)
+               
+        #     ###### now re-bin the images if you used single-photon counting
+        #     print("Re-binning images with known shifts by vertically shifting photons.")
+        #     processed_images = []
+        #     for i,img in enumerate(processed_images):
+        #             processed_images.append(img.single_photon_counting(
+        #                 **spc_parameters,
+        #                 vertical_shift = self.shifts[i])[0])         
+
+        # elif self.align_images and img.n_images == 1: 
+        #     print("Only one file found. No energy correlation necessary.")
+        # # else:
+        # #     print("Aligning images is disabled. No energy correlation will be performed.")
+
+        return Generated_1D_RIXS_Spectra(self.ds_1d)
 
 
-    def _find_aligning_range(self, threshold=0.1):
+    def _find_aligning_range(processed_images, threshold=0.1):
         """
         Find the position of the first significant peak in the image spectrum.
         Uses a moving average to smooth the data and identifies where signal rises
@@ -449,13 +521,8 @@ class RIXS_Raw_Images:
         """
 
         print("Attempting to find the range around the elastic line...")
-
-        # Get the spectrum (mean along horizontal axis)
-        if self.all_imgs_processed is not None:
-            spectrum = self.all_imgs_processed.mean(axis=0).mean(axis=1)
-        else:
-            raise ValueError("Image must be processed first using single_photon_counting")
         
+        spectrum = processed_images.mean(axis=0).mean(axis=1)
         # Find where signal rises above threshold * max intensity
         threshold_value = threshold * np.max(spectrum)
         # Calculate the moving average with a window of 3
@@ -533,7 +600,116 @@ class RIXS_Raw_Images:
             plt.show()
 
 
-    def _calculate_shift(self, pixel_row_start, pixel_row_stop, fit_shifts, correlation_batch_size, poly_order):
+    def save_2d_dataset_hdf5(self, path_dir, filename_save_auto=True, filename_save='',
+                         save_normalized_images=True):
+        """
+        Save the pre-processed dataset to a hdf5 file, containing a single dataset 'data'
+        and attributes with experiment number, filepath_dir and run_number.
+        Parameters
+        ----------
+        path_dir : str
+            Directory where to save the file
+        filename_save_auto : bool
+            If True, automatically generate the filename based on run number and number of images
+        filename_save : str
+            If filename_save_auto is False, use this filename to save the file
+        """
+        
+        if not filename_save_auto and filename_save == '':
+            raise ValueError("Either filename_save_auto should be True or filename_save should be provided.")
+        
+        if filename_save_auto:
+            if isinstance(self.run_number, list):
+                run_number_str = "_".join(f"{int(num):04d}" for num in self.run_number)  # Join list elements with "_" and format as 4 digits
+            else:
+                run_number_str = f"{int(self.run_number):04d}"  # Convert single run number to a 4-digit string
+
+            filename_save = f"{self.folder}_run_{run_number_str}_{np.shape(self.imgs_lc)[0]:03d}_imgs.hdf5"
+
+        full_path = os.path.join(path_dir, filename_save)
+        #calculate the normalized images
+        if save_normalized_images:
+            #calculate the normalized images
+            mean_norm_factor = self.normalization_factors.mean() 
+            imgs_to_save = np.array([self.all_imgs_processed[i, :, :] / self.normalization_factors[i] * mean_norm_factor for i in range(self.all_imgs_processed.shape[0])])
+
+        with h5py.File(full_path, 'w') as hf:
+            hf.create_dataset('data', data=imgs_to_save, dtype='float32')
+            hf.attrs['exp_number'] = self.exp_number
+            hf.attrs['filename_dir'] = self.folder
+            # Save only the first element if self.run_number is a list
+            if isinstance(self.run_number, list):
+                hf.attrs['run_number'] = f"{self.folder}_run#_{int(self.run_number[0]):04d}"  # Save formatted run number
+            else:
+                hf.attrs['run_number'] = f"{self.folder}_run#_{int(self.run_number):04d}"
+
+        print(f"Pre-processed dataset saved as {filename_save} \n\n")
+
+
+    def save_2d_dataset_xarray(self, path_dir=None, filename_save_auto=True, filename_save=''):
+        # Validate ds_1d
+        if not hasattr(self, "ds_1d") or len(self.ds_1d.keys()) == 0:
+            raise ValueError("self.ds_1d is empty or missing. Run generate_rixs_spectra first.")
+
+        # Determine output directory and filename
+        if path_dir is None:
+            path_dir = self.folder
+        if not filename_save_auto and filename_save == '':
+            raise ValueError("Either filename_save_auto should be True or filename_save should be provided.")
+
+        n_entries = len(self.ds_1d.keys())
+        if filename_save_auto:
+            if isinstance(self.run_number, list):
+                run_number_str = "_".join(f"{int(num):04d}" for num in self.run_number)
+            else:
+                run_number_str = f"{int(self.run_number):04d}"
+            filename_save = f"{os.path.basename(self.folder)}_run_{run_number_str}_{n_entries:03d}_imgs.nc"
+        full_path = os.path.join(path_dir, filename_save)
+
+        # Find source 2D image container (try several known attributes)
+        if self.all_imgs_processed is None:
+            raise ValueError("Images not yet processed. Ensure 2D images are available before saving.")
+
+        if self.all_imgs_processed.shape[0] < n_entries:
+            raise ValueError("Number of available 2D images does not match number of entries in ds_1d.")
+
+        # Build new xarray Dataset with 2D DataArrays
+        ds_2d = xr.Dataset()
+        sorted_keys = sorted(self.ds_1d.keys(), key=lambda k: int(k))
+        for idx, key in enumerate(sorted_keys):
+            da_1d = self.ds_1d[key]
+            # extract scalar normalization (norm was stored as repeated vector)
+            norm_val = None
+            if 'variable' in da_1d.coords and 'norm' in da_1d.coords['variable'].values:
+                norm_vec = da_1d.sel(variable='norm').values
+                if norm_vec.size > 0:
+                    norm_val = float(norm_vec.flat[0])
+            if norm_val is None:
+                norm_val = 1.0
+
+            x_coords = np.arange(self.all_imgs_processed.shape[2])
+            y_coords = np.arange(self.all_imgs_processed.shape[1])
+
+            attrs = dict(da_1d.attrs) if hasattr(da_1d, "attrs") else {}
+            attrs.update({"normalization_factor": float(norm_val)})
+
+            da2 = xr.DataArray(
+                self.all_imgs_processed[idx,:,:],
+                dims=("row", "col"),
+                coords={"row": y_coords, "col": x_coords},
+                attrs=attrs
+            )
+            ds_2d[key] = da2
+
+        # assign to instance and save to netcdf
+        ds_2d.to_netcdf(full_path)
+        print(f"2D xarray dataset saved to {full_path}")
+
+        return ds_2d
+
+
+    def _calculate_shift(self, pixel_row_start, pixel_row_stop, 
+                         process_shifts='', correlation_batch_size=1, poly_order=1):
 
         """
         correct_shift2 method
@@ -577,19 +753,18 @@ class RIXS_Raw_Images:
 
         # index_aux = range(0, self.all_imgs_processed.shape[0], correlation_batch_size)
         index_aux = np.arange(0, self.all_imgs_processed.shape[0], correlation_batch_size)[:self.all_imgs_processed.shape[0] // correlation_batch_size]
-        if fit_shifts:
+
+        if process_shifts=='fit':
             coeffs = np.polyfit(index_aux, real_shifts, deg=poly_order)
             self.shifts = np.polyval(coeffs, range(0, self.all_imgs_processed.shape[0]))
-        else:
+        elif process_shifts=='smooth':
             # Extrapolate by specifying left and right values
-            self.shifts = np.interp(range(0, self.all_imgs_processed.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1])
-            # Smooth the shifts using a moving average with window size of correlation_batch_size*2
-            # window_size = correlation_batch_size * 3
-            # kernel = np.ones(window_size) / window_size
-            # self.shifts = np.convolve(self.shifts, kernel, mode='same')
-            
+            self.shifts = np.interp(range(0, self.all_imgs_processed.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1])          
             sigma = correlation_batch_size   # Adjust sigma based on correlation_batch_size
             self.shifts = gaussian_filter1d(self.shifts, sigma=sigma)
+        else:
+            self.shifts = np.interp(range(0, self.all_imgs_processed.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1]) 
+
 
         print("Shifting images by: ", end="")
         for i in range(len(self.shifts)):
@@ -737,7 +912,7 @@ class RIXS_Raw_Images:
 
         return averaged_spectra
     
-    def _calculate_energy_axis(self, auto_alignment, index_elastic_line=None):
+    def _calculate_energy_axis(self,calibration, auto_alignment, index_elastic_line=None):
         """
         Calculate the energy axis for the RIXS spectra using the calibration factor.
         The energy loss is calculated based on the pixel positions and the calibration factor.
@@ -769,7 +944,7 @@ class RIXS_Raw_Images:
 
         # Calculate the energy axis using the calibration factor
         energy_loss = -(np.linspace(0, n_pixels, n_pixels) - index_elastic_line) \
-            * self.calibration/1000/self.subdivide_bins_factor_y
+            * calibration/1000/self.subdivide_bins_factor_y
         
         energy_loss = energy_loss[::-1]      
 
@@ -781,134 +956,134 @@ class RIXS_Raw_Images:
         elif self.facility == "TPS":
             self.save_pre_processed_dataset_TPS(path_dir, filename_save_auto, filename_save, auto_alignment, index_elastic_line)
 
-    def save_pre_processed_dataset_ESRF(self, path_dir, filename_save_auto, filename_save = ''):
-        """
-        Save the pre-processed dataset to a file
-        """
+    # def save_pre_processed_dataset_ESRF(self, path_dir, filename_save_auto, filename_save = ''):
+    #     """
+    #     Save the pre-processed dataset to a file
+    #     """
         
-        if not filename_save_auto and filename_save == '':
-            raise ValueError("Either filename_save_auto should be True or filename_save should be provided.")
+    #     if not filename_save_auto and filename_save == '':
+    #         raise ValueError("Either filename_save_auto should be True or filename_save should be provided.")
         
-        if filename_save_auto:
-            if isinstance(self.run_number, list):
-                run_number_str = "_".join(f"{int(num):04d}" for num in self.run_number)  # Join list elements with "_" and format as 4 digits
-            else:
-                run_number_str = f"{int(self.run_number):04d}"  # Convert single run number to a 4-digit string
+    #     if filename_save_auto:
+    #         if isinstance(self.run_number, list):
+    #             run_number_str = "_".join(f"{int(num):04d}" for num in self.run_number)  # Join list elements with "_" and format as 4 digits
+    #         else:
+    #             run_number_str = f"{int(self.run_number):04d}"  # Convert single run number to a 4-digit string
 
-            filename_save = f"{self.identifier_string}_run_{run_number_str}_{np.shape(self.imgs_lc)[0]:03d}_imgs.hdf5"
+    #         filename_save = f"{self.identifier_string}_run_{run_number_str}_{np.shape(self.imgs_lc)[0]:03d}_imgs.hdf5"
 
-        full_path = os.path.join(path_dir, filename_save)
-        with h5py.File(full_path, 'w') as hf:
-            hf.create_dataset('data', data=self.imgs_lc, dtype='float32')
-            hf.attrs['exp_number'] = self.exp_number
-            hf.attrs['filename_dir'] = self.identifier_string
-            hf.attrs['normalization_factor'] = self.normalization_factors.sum()
-            hf.attrs['factor_ADC'] = self.factor_ADC
-            hf.attrs['calibration'] = self.calibration
-            hf.attrs['curve_a'] = self.curve_a
-            hf.attrs['curve_b'] = self.curve_b
-            hf.attrs['roi_x'] = self.roi_x
-            hf.attrs['roi_y'] = self.roi_y
-            hf.attrs['subdivide_bins_factor_x'] = self.subdivide_bins_factor_x
-            hf.attrs['subdivide_bins_factor_y'] = self.subdivide_bins_factor_y
-            # Save only the first element if self.run_number is a list
-            if isinstance(self.run_number, list):
-                hf.attrs['run_number'] = f"{self.identifier_string}_run#_{int(self.run_number[0]):04d}"  # Save formatted run number
-            else:
-                hf.attrs['run_number'] = f"{self.identifier_string}_run#_{int(self.run_number):04d}"
+    #     full_path = os.path.join(path_dir, filename_save)
+    #     with h5py.File(full_path, 'w') as hf:
+    #         hf.create_dataset('data', data=self.imgs_lc, dtype='float32')
+    #         hf.attrs['exp_number'] = self.exp_number
+    #         hf.attrs['filename_dir'] = self.identifier_string
+    #         hf.attrs['normalization_factor'] = self.normalization_factors.sum()
+    #         hf.attrs['factor_ADC'] = self.factor_ADC
+    #         hf.attrs['calibration'] = self.calibration
+    #         hf.attrs['curve_a'] = self.curve_a
+    #         hf.attrs['curve_b'] = self.curve_b
+    #         hf.attrs['roi_x'] = self.roi_x
+    #         hf.attrs['roi_y'] = self.roi_y
+    #         hf.attrs['subdivide_bins_factor_x'] = self.subdivide_bins_factor_x
+    #         hf.attrs['subdivide_bins_factor_y'] = self.subdivide_bins_factor_y
+    #         # Save only the first element if self.run_number is a list
+    #         if isinstance(self.run_number, list):
+    #             hf.attrs['run_number'] = f"{self.identifier_string}_run#_{int(self.run_number[0]):04d}"  # Save formatted run number
+    #         else:
+    #             hf.attrs['run_number'] = f"{self.identifier_string}_run#_{int(self.run_number):04d}"
 
-        print(f"Pre-processed dataset saved as {filename_save} \n\n")
+    #     print(f"Pre-processed dataset saved as {filename_save} \n\n")
 
 
-    def save_pre_processed_dataset_TPS(self, path_dir=None, filename_save_auto=True, filename_save = '',
-                                   auto_alignment=True, index_elastic_line=None):
-        """
-        Save the pre-processed dataset to a file in HDF5 format.
-        Parameters:
-        -----------
-        path_dir : str
-            The directory path where the file will be saved.
-        filename_save_auto : bool
-            If True, automatically generate the filename based on the object's attributes.
-        filename_save : str, optional
-            The custom filename to save the dataset. If not provided and `filename_save_auto` is False, 
-            a ValueError will be raised.
-        auto_alignment : bool, optional
-            If True, automatically align the spectrum based on the elastic line.
-        index_elastic_line : int, optional
-            Index of the elastic line in the spectrum. If not provided, it will be calculated.
-        Raises:
-        -------
-        ValueError
-            If both `filename_save_auto` is False and `filename_save` is an empty string.
-        Notes:
-        ------
-        - The method saves the dataset (`self.imgs_lc`) and additional metadata as attributes in the HDF5 file.
-        - If `self.run_number` is a list, only the first element is saved as part of the metadata.
-        - The generated filename (if `filename_save_auto` is True) includes the directory path, run number, 
-          and the number of images in the dataset.
-        """
+    # def save_pre_processed_dataset_TPS(self, path_dir=None, filename_save_auto=True, filename_save = '',
+    #                                auto_alignment=True, index_elastic_line=None):
+    #     """
+    #     Save the pre-processed dataset to a file in HDF5 format.
+    #     Parameters:
+    #     -----------
+    #     path_dir : str
+    #         The directory path where the file will be saved.
+    #     filename_save_auto : bool
+    #         If True, automatically generate the filename based on the object's attributes.
+    #     filename_save : str, optional
+    #         The custom filename to save the dataset. If not provided and `filename_save_auto` is False, 
+    #         a ValueError will be raised.
+    #     auto_alignment : bool, optional
+    #         If True, automatically align the spectrum based on the elastic line.
+    #     index_elastic_line : int, optional
+    #         Index of the elastic line in the spectrum. If not provided, it will be calculated.
+    #     Raises:
+    #     -------
+    #     ValueError
+    #         If both `filename_save_auto` is False and `filename_save` is an empty string.
+    #     Notes:
+    #     ------
+    #     - The method saves the dataset (`self.imgs_lc`) and additional metadata as attributes in the HDF5 file.
+    #     - If `self.run_number` is a list, only the first element is saved as part of the metadata.
+    #     - The generated filename (if `filename_save_auto` is True) includes the directory path, run number, 
+    #       and the number of images in the dataset.
+    #     """
         
-        if not filename_save_auto and filename_save == '':
-            raise ValueError("Either filename_save_auto should be True or filename_save should be provided.")
+    #     if not filename_save_auto and filename_save == '':
+    #         raise ValueError("Either filename_save_auto should be True or filename_save should be provided.")
         
-        if path_dir is None:
-            path_dir = self.folder
-            print("Warning: Path directory is not provided. Using the default folder path.")
+    #     if path_dir is None:
+    #         path_dir = self.folder
+    #         print("Warning: Path directory is not provided. Using the default folder path.")
         
-        if filename_save_auto:
-            if isinstance(self.run_number, list):
-                filename_save = os.path.join(path_dir, f"rixs_{os.path.basename(self.file_names[0]).split('_')[1]}_{'_'.join([str(rn) for rn in self.run_number])}_processed.hdf5")
-            else:
-                filename_save = os.path.join(path_dir, f"{os.path.splitext(os.path.basename(self.file_names[0]))[0][:-4]}_processed.hdf5")
+    #     if filename_save_auto:
+    #         if isinstance(self.run_number, list):
+    #             filename_save = os.path.join(path_dir, f"rixs_{os.path.basename(self.file_names[0]).split('_')[1]}_{'_'.join([str(rn) for rn in self.run_number])}_processed.hdf5")
+    #         else:
+    #             filename_save = os.path.join(path_dir, f"{os.path.splitext(os.path.basename(self.file_names[0]))[0][:-4]}_processed.hdf5")
 
 
-        full_path = os.path.join(path_dir, filename_save)
-        with h5py.File(full_path, 'w') as hf:
-            # Open the first file to copy attributes
-            with h5py.File(self.file_names[0], 'r') as original_file:
-                for attr_name, attr_value in original_file.attrs.items():
-                    hf.attrs[attr_name] = attr_value
+    #     full_path = os.path.join(path_dir, filename_save)
+    #     with h5py.File(full_path, 'w') as hf:
+    #         # Open the first file to copy attributes
+    #         with h5py.File(self.file_names[0], 'r') as original_file:
+    #             for attr_name, attr_value in original_file.attrs.items():
+    #                 hf.attrs[attr_name] = attr_value
 
-            # Modify the 'header' attribute to replace the "Iph" value
-            header = hf.attrs['header']
-            header_parts = header.split(":")[1].split(",")
-            for i, part in enumerate(header_parts):
-                if "Iph" in part:
-                    key, value = part.strip().split(" ")
-                    decimal_places = len(value.split(".")[1]) if "." in value else 0
-                    new_value = f"{self.normalization_factors.sum():.{decimal_places}f}"
-                    header_parts[i] = f"{key} {new_value}"
-            hf.attrs['header'] = header.split(":")[0]+": "+ ",".join(header_parts)
+    #         # Modify the 'header' attribute to replace the "Iph" value
+    #         header = hf.attrs['header']
+    #         header_parts = header.split(":")[1].split(",")
+    #         for i, part in enumerate(header_parts):
+    #             if "Iph" in part:
+    #                 key, value = part.strip().split(" ")
+    #                 decimal_places = len(value.split(".")[1]) if "." in value else 0
+    #                 new_value = f"{self.normalization_factors.sum():.{decimal_places}f}"
+    #                 header_parts[i] = f"{key} {new_value}"
+    #         hf.attrs['header'] = header.split(":")[0]+": "+ ",".join(header_parts)
 
-            # Save the sum of self.imgs_lc, each multiplied by the corresponding normalization factor
-            summed_data = np.sum(
-                [self.imgs_lc[i] * self.normalization_factors[i] for i in range(self.imgs_lc.shape[0])],
-                axis=0
-            ) / self.normalization_factors.mean()
-            rixs_spectrum = summed_data.sum(axis=1)
+    #         # Save the sum of self.imgs_lc, each multiplied by the corresponding normalization factor
+    #         summed_data = np.sum(
+    #             [self.imgs_lc[i] * self.normalization_factors[i] for i in range(self.imgs_lc.shape[0])],
+    #             axis=0
+    #         ) / self.normalization_factors.mean()
+    #         rixs_spectrum = summed_data.sum(axis=1)
 
-            # Save the summed data to the new file
-            hf.create_dataset('data', data=summed_data)
+    #         # Save the summed data to the new file
+    #         hf.create_dataset('data', data=summed_data)
 
-            # Save the 1D RIXS spectrum
-            #calculate the energy axis
-            energy_loss = self._calculate_energy_axis(auto_alignment=auto_alignment, 
-                                                  index_elastic_line=index_elastic_line)
-            hf.create_dataset('rixs_spectrum', data=np.column_stack((energy_loss, rixs_spectrum[::-1])))
+    #         # Save the 1D RIXS spectrum
+    #         #calculate the energy axis
+    #         energy_loss = self._calculate_energy_axis(auto_alignment=auto_alignment, 
+    #                                               index_elastic_line=index_elastic_line)
+    #         hf.create_dataset('rixs_spectrum', data=np.column_stack((energy_loss, rixs_spectrum[::-1])))
 
-            # Save the normalization factor as an attribute
-            hf.attrs['normalization_factor'] = self.normalization_factors.sum()
-            hf.attrs['factor_ADC'] = self.factor_ADC
-            hf.attrs['calibration'] = self.calibration
-            hf.attrs['curve_a'] = self.curve_a
-            hf.attrs['curve_b'] = self.curve_b
-            hf.attrs['roi_x'] = self.roi_x
-            hf.attrs['roi_y'] = self.roi_y
-            hf.attrs['subdivide_bins_factor_x'] = self.subdivide_bins_factor_x
-            hf.attrs['subdivide_bins_factor_y'] = self.subdivide_bins_factor_y
+    #         # Save the normalization factor as an attribute
+    #         hf.attrs['normalization_factor'] = self.normalization_factors.sum()
+    #         hf.attrs['factor_ADC'] = self.factor_ADC
+    #         hf.attrs['calibration'] = self.calibration
+    #         hf.attrs['curve_a'] = self.curve_a
+    #         hf.attrs['curve_b'] = self.curve_b
+    #         hf.attrs['roi_x'] = self.roi_x
+    #         hf.attrs['roi_y'] = self.roi_y
+    #         hf.attrs['subdivide_bins_factor_x'] = self.subdivide_bins_factor_x
+    #         hf.attrs['subdivide_bins_factor_y'] = self.subdivide_bins_factor_y
 
-        print(f"Pre-processed hdf5 dataset saved as {filename_save} \n")
+    #     print(f"Pre-processed hdf5 dataset saved as {filename_save} \n")
 
 
     def save_txt_rixs_spectra(self, path_dir=None, filename_save_auto=True, filename_save="",
