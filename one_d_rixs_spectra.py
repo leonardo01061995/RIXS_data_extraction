@@ -26,24 +26,17 @@ class Generated_1D_RIXS_Spectra:
 
 
     def align_spectra(self,
-                        sample_name = '',
-                        align_spectra=False,
                         pixel_row_start=None,
                         pixel_row_stop=None,
                         fit_shifts=False,
                         smooth_shifts=False,
                         correlation_batch_size=10,
                         poly_order=1,
-                        elastic_line_point=None,
                         plot=False,):
         """
         Process the extracted spectra to align energy shifts and calculate average spectrum.
         Parameters
         ----------
-        sample_name : str
-            Name of the sample for metadata purposes.
-        align_spectra : bool
-            Whether to align the spectra by correcting energy shifts.
         pixel_row_start : int
             Starting pixel row for the correlation region (typically near elastic line).
         pixel_row_stop : int
@@ -56,8 +49,6 @@ class Generated_1D_RIXS_Spectra:
             Number of spectra to average for correlation calculation.
         poly_order : int
             Order of the polynomial for fitting shifts if fit_shifts is True.
-        elastic_line_point : float
-            The energy point of the elastic line for calibration.
         plot : bool
             Whether to plot the processed spectra.
         """
@@ -73,28 +64,24 @@ class Generated_1D_RIXS_Spectra:
         # Stack all y_data arrays along a new dimension
         all_y_data = np.stack([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
         if all_y_data.shape[0] == 1:
-            align_spectra = False
+            print("Only one spectrum found. Skipping alignment.")
+            return
 
         #save the pixel_row_start, pixel_row_stop and sample name inside the spectra_xarrays
         for spec_name in self.spectra_xarray.data_vars:
             self.spectra_xarray[spec_name].attrs['pixel_row_start'] = self.pixel_row_start
             self.spectra_xarray[spec_name].attrs['pixel_row_stop'] = self.pixel_row_stop
-            self.spectra_xarray[spec_name].attrs['sample_name'] = sample_name if sample_name else 'unknown'
 
-        if align_spectra:
-            ### correct the energy shifts
-            _ = self._correct_shift(all_y_data, 
-                                    self.pixel_row_start, self.pixel_row_stop, 
-                                    fit_shifts=fit_shifts, 
-                                    smooth_shifts=smooth_shifts,
-                                    correlation_batch_size=correlation_batch_size, 
-                                    poly_order=poly_order)
-        
-            
-        # _ = self.set_elastic_energy(elastic_line_point=elastic_line_point)
-        
+        ### correct the energy shifts
+        _ = self._correct_shift(all_y_data, 
+                                self.pixel_row_start, self.pixel_row_stop, 
+                                fit_shifts=fit_shifts, 
+                                smooth_shifts=smooth_shifts,
+                                correlation_batch_size=correlation_batch_size, 
+                                poly_order=poly_order)     
+                   
         if plot:
-            self.plot_spectra(align_spectra, pixel_row_start=self.pixel_row_start, pixel_row_stop=self.pixel_row_stop)
+            self.plot_spectra(True, pixel_row_start=self.pixel_row_start, pixel_row_stop=self.pixel_row_stop)
 
     def save_to_hdf5(self, file_path_save, 
                      save_avg_spectrum=False):
@@ -239,45 +226,11 @@ class Generated_1D_RIXS_Spectra:
         """
         if not hasattr(self, 'spectra_xarray'):
             raise ValueError("No spectra have been extracted. Please run extract_1d_runs or process_spectra first.")
-
-        plt.figure()
-        max_spectra = 35
-        spectra_to_plot = list(self.spectra_xarray.items())[::max(1, len(self.spectra_xarray) // max_spectra)]
-        color_list = [cm.lipari(i) for i in np.linspace(0, 1, len(spectra_to_plot))]
-        for i, (spec_name, spec_data) in enumerate(spectra_to_plot):
-            plt.plot(spec_data.sel(variable='x'), 
-                    spec_data.sel(variable='y'), label=spec_name, color=color_list[i])
         
-        # Plot the average spectrum
-        # sum_spectrum = np.sum([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
-        # sum_norm = np.sum([self.spectra_xarray[spec].sel(variable='norm').values for spec in self.spectra_xarray.data_vars], axis=0)
-        # avg_spectrum = sum_spectrum / sum_norm
-        # plt.plot(self.spectra_xarray[list(self.spectra_xarray.data_vars)[0]].sel(variable='x'), avg_spectrum, 
-        #          label='Average Spectrum', linewidth=2, color='black')
-        # Plot the average spectrum if it does not exist
-        if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
-            ds_avg = self.calculate_average_spectrum()
-        else:
-            ds_avg = self.avg_spectrum_xr_dataset.copy(deep=True)
-
-        avg_spec = ds_avg['avg_spectrum']
-        plt.plot(avg_spec.sel(variable='x'), avg_spec.sel(variable='y')/len(self.spectra_xarray.data_vars), 
-                 label='Average Spectrum', linewidth=2, color='black')
-        
-        # Plot vertical dashed lines for pixel_row_start and pixel_row_stop
-        if pixel_row_start is not None and pixel_row_stop is not None:
-            plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_start], color='k', linestyle='--', label='Start Pixel Row')
-            plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_stop], color='k', linestyle='--', label='Stop Pixel Row')
-        plt.xlabel('Energy (eV)')
-        plt.ylabel('Intensity')
-        # plt.legend()
-        plt.title('Extracted Spectra')
-        plt.grid()
-        # plt.show()
-
         #shifts
         if align_spectra:
-            plt.figure(figsize=(10,5))
+            plt.figure(figsize=(11,6))
+            plt.subplot(2,1,1)
             plt.plot(self.real_shifts, 'ko-', label='Real Shifts')  # 'ko-' for black circles connected by lines
             plt.plot(self.shifts, 'ro-', label='Used Shifts')
             plt.xlabel('Image Index')
@@ -285,7 +238,68 @@ class Generated_1D_RIXS_Spectra:
             plt.title('Real Shifts of Images')
             plt.grid()
             plt.legend()
-            # plt.show()
+
+            # Calculate integrals between pixel_row_start and pixel_row_stop for each spectrum
+            integrals = []
+            i0 = int(self.pixel_row_start)
+            i1 = int(self.pixel_row_stop)
+            for spec_name in self.spectra_xarray.data_vars:
+                da = self.spectra_xarray[spec_name]
+                y_vals = da.sel(variable='y').values
+                integrals.append(np.sum(y_vals[i0:i1+1]))
+
+            # Plot integrals in the second subplot
+            plt.subplot(2, 1, 2)
+            plt.plot(integrals, 'bo-', label='Integrated intensity')
+            plt.axhline(np.mean(integrals), color='k', linestyle='--', label='Mean')
+            plt.xlabel('Image Index')
+            plt.ylabel('Integrated intensity (arb. units)')
+            plt.title(f'Integral between pixels {i0} and {i1}')
+            plt.grid()
+            plt.legend()
+
+            plt.show()
+
+        max_spectra = 10
+        spectra_to_plot = list(self.spectra_xarray.items())[::max(1, len(self.spectra_xarray) // max_spectra)]
+        color_list = [cm.managua(i) for i in np.linspace(0, 1, len(spectra_to_plot))]
+        plt.figure(figsize=(11,3))
+        plt.subplot(1, 2, 1)
+        for i, (spec_name, spec_data) in enumerate(spectra_to_plot):
+            plt.plot(spec_data.sel(variable='x')+self.shifts[i], 
+                    spec_data.sel(variable='y'), label=spec_name, color=color_list[i])
+        plt.xlabel(self.spectra_xarray[spec_name].attrs.get('x_name', 'x'))
+        plt.ylabel(self.spectra_xarray[spec_name].attrs.get('y_name', 'y'))
+        plt.title('Raw spectra')
+        plt.grid()
+        plt.legend()
+        plt.tight_layout()
+
+        plt.subplot(1, 2, 2)
+        for i, (spec_name, spec_data) in enumerate(spectra_to_plot):
+            plt.plot(spec_data.sel(variable='x'), 
+                    spec_data.sel(variable='y'), label=spec_name, color=color_list[i])
+
+        if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
+            ds_avg = self.calculate_average_spectrum()
+        else:
+            ds_avg = self.avg_spectrum_xr_dataset.copy(deep=True)
+
+        avg_spec = ds_avg['avg_spectrum']
+        plt.plot(avg_spec.sel(variable='x'), avg_spec.sel(variable='y')/len(self.spectra_xarray.data_vars), 
+                 label='Avg.', linewidth=2, color='black')
+        
+        # Plot vertical dashed lines for pixel_row_start and pixel_row_stop
+        if pixel_row_start is not None and pixel_row_stop is not None:
+            plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_start], color='k', linestyle='--')
+            plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_stop], color='k', linestyle='--')
+        plt.xlabel(self.spectra_xarray[spec_name].attrs.get('x_name', 'x'))
+        plt.ylabel(self.spectra_xarray[spec_name].attrs.get('y_name', 'y'))
+        plt.legend()
+        plt.title('Aligned spectra')
+        plt.grid()
+        plt.tight_layout()
+        plt.show()
 
 
     @staticmethod
@@ -336,11 +350,13 @@ class Generated_1D_RIXS_Spectra:
         return range_start, range_stop
     
     
-    def set_elastic_energy(self, auto_elastic_determination=False, elastic_line_point=None, calibration=1):
+    def calibrate_energy(self, auto_elastic_determination=False, elastic_line_point=None, calibration=1):
         """
         Set the elastic line energy point and apply calibration to the spectra.
         Parameters
         ----------
+        auto_elastic_determination : bool
+            Whether to automatically determine the elastic line point.
         elastic_line_point : float
             The energy point of the elastic line.
         calibration : float
@@ -379,6 +395,9 @@ class Generated_1D_RIXS_Spectra:
             for spec_name in self.spectra_xarray.data_vars:
                 self.spectra_xarray[spec_name].loc[dict(variable='x')] -= elastic_line_point
                 self.spectra_xarray[spec_name].loc[dict(variable='x')] *= calibration
+                self.spectra_xarray[spec_name].attrs['elastic_line_point'] = elastic_line_point
+                self.spectra_xarray[spec_name].attrs['calibration'] = calibration
+                self.spectra_xarray[spec_name].attrs['x_name'] = 'Energy Loss (eV)'
             
             self.energy_axis_calculated = True
             self.calculate_average_spectrum()
@@ -487,7 +506,6 @@ class Generated_1D_RIXS_Spectra:
             # Approximate self.shifts[num_spectrum] to the closest half-integer            
                 self.spectra_xarray[spec_name].loc[dict(variable='x')] -= self.shifts[num_spectrum]
                 print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
-
 
         print("")
         end_time = time.perf_counter()
