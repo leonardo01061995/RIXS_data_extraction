@@ -48,19 +48,29 @@ class RIXS_Image(ABC):
     def _get_energy(self):
         pass
 
+    def plot(self):
+        pass
+
     def process_imgs(self,
                      use_spc,
                      spc_parameters={},
                      no_spc_parameters={},
+                     plot_generation=False
                      ):
         
         if use_spc:
             self.single_photon_counting(**spc_parameters)
+            if plot_generation:
+                self.plot_generation(use_spc, **spc_parameters)
         else:
             self._remove_bkg_and_filter(**no_spc_parameters)
+            if plot_generation:
+                self.plot_generation(use_spc, **no_spc_parameters)
 
         return self.imgs_processed, self.normalization_factor
 
+    def plot_generation(self, use_spc):
+        pass
 
     @abstractmethod
     def _remove_bkg_and_filter(self,
@@ -693,16 +703,15 @@ class DLS_Image(RIXS_Image):
         super().__init__()
         self.file_path = file_path
 
-
         start_time = time.time()
-        print(f"Loading DLS image from {self.file_path}...")
+        print(f"Loading DLS images from {self.file_path}...")
+        self._get_run_number()
         self.raw_data = self._get_raw_data()
         self.n_images = self.raw_data.shape[0]
-        self._get_run_number()
         self._get_normalization_factor()
         self._get_attributes()
         elapsed_time = time.time() - start_time
-        print(f"DLS image loaded successfully from {self.file_path}. Time taken: {elapsed_time:.2f} seconds.")
+        print(f"DLS images and attributes loaded successfully.\nElapsed time: {elapsed_time:.2f} seconds.")
 
     def _get_run_number(self):
         """
@@ -739,25 +748,22 @@ class DLS_Image(RIXS_Image):
         Exception
             If required parameters cannot be found in the NeXus file
         """
-        print(f"Retrieving images for run {self.run_number}.")
-        start_time = time.perf_counter()
-        
+
         with nxload(self.file_path,mode='r') as f:
             try:
-                self.raw_data = f.entry['andor']['data'].nxvalue 
+                raw_data = f.entry['andor']['data'].nxvalue 
             except:
                 try:
-                    self.raw_data = f.entry1['andor']['data'].nxvalue
+                    raw_data = f.entry1['andor']['data'].nxvalue
                 except:
                     raise ValueError("Could not retrieve raw images from NeXus file. Both 'entry' and 'entry1' paths failed.")
 
-            if self.raw_data.ndim == 2:
-                self.raw_data = np.expand_dims(self.raw_data, axis=0)
-                
+            if raw_data.ndim == 2:
+                raw_data = np.expand_dims(raw_data, axis=0)
 
-        end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
+        print(f"Retrieved {raw_data.shape[0]} images from NeXus file.")
+
+        return raw_data.astype(np.float32)
 
     def _get_attributes(self):
         """
@@ -777,7 +783,7 @@ class DLS_Image(RIXS_Image):
             "y": "instrument/manipulator/y",
             "z": "instrument/manipulator/z",
             "T": "instrument/lakeshore336/sample",
-            "polarization": "instrument/id/polarization",
+            "polarization": "instrument/id/polarisation",
             "count_time": "instrument/m4c1/count_time",
         }
         self.attributes = {}
@@ -785,26 +791,32 @@ class DLS_Image(RIXS_Image):
         # Map the attributes using metadata_name_mapping
         with nxload(self.file_path,mode='r') as f:
             for key, mapped_key in metadata_paths.items():
-                if key in self.header:
+                try:
+                    self.attributes[key] = f[source_nexus[0] + mapped_key].nxvalue
+                except (KeyError, AttributeError, Exception):
                     try:
-                        self.attributes[key] = f[source_nexus[0]+mapped_key][:]
-                    except (KeyError, AttributeError):
-                        try: 
-                            self.attributes[key] = f[source_nexus[1]+mapped_key][:]
-                        except:
-                            print(f"Warning: Could not retrieve {mapped_key} from NeXus file")
+                        self.attributes[key] = f[source_nexus[1] + mapped_key].nxvalue
+                    except (KeyError, AttributeError, Exception):
+                        print(f"Warning: Could not retrieve {mapped_key} from NeXus file")
+                        self.attributes[key] = np.nan
 
             #Retrieve the counting time
             try: 
-                self.data_count_time = f.entry['instrument']['andor']['count_time']
+                self.data_count_time = f.entry['instrument']['andor']['count_time'].nxvalue
             except:
                 try:
-                    self.data_count_time = f.entry1['instrument']['andor']['count_time']
+                    self.data_count_time = f.entry1['instrument']['andor']['count_time'].nxvalue
                 except:
                     print("WARNING: Could not retrieve count time from NeXus file")
                     self.data_count_time = 120
         
+        _ = self._get_energy()
+        
         return self.attributes
+    
+    def _get_energy(self):
+        self.energy = self.attributes["energy"]
+        return self.energy
 
     def _get_normalization_factor(self):
         with nxload(self.file_path,mode='r') as f:  
@@ -818,6 +830,8 @@ class DLS_Image(RIXS_Image):
                     self.normalization_factor = 1
         if isinstance(self.normalization_factor, float):
             self.normalization_factor = [self.normalization_factor]*self.n_images
+
+        self.normalization_factor = np.array(self.normalization_factor)
 
         return self.normalization_factor
 
@@ -854,21 +868,13 @@ class DLS_Image(RIXS_Image):
         -------
         None
         """
-        dark_img_raw, _ = self._get_dark_image(file_path_dark=kwargs.get('file_path_dark'),
+        self._get_dark_image(file_path_dark=kwargs.get('file_path_dark'),
                              dark_from_processed_file=kwargs.get('dark_from_processed_file', False),
                              hdf5_path_to_dark=kwargs.get('hdf5_path_to_dark', None),
                              dark_median_filter_kernel_size=kwargs.get('dark_median_filter_kernel_size', [5,15]),
                              dark_smoothing_parameters=kwargs.get('dark_smoothing_parameters', [3,15]),
                              filtertype=kwargs.get('filtertype', 'gaussian'),
-                             mean_before_spike_removal_dark=kwargs.get('mean_before_spike_removal_dark', True),
-                             index_start_fit_bkg=kwargs.get('index_start_fit_bkg', 1192))
-        
-        self._filter_and_smooth_dark_image(dark_img_raw,
-                                            kernel_size = kwargs.get('data_median_filter_kernel_size', [5,15]),
-                                            filter_parameter = kwargs.get('dark_smoothing_parameters', [3,15]),
-                                            filtertype=kwargs.get('filtertype', 'gaussian'),
-                                            mean_before_spike_removal_dark=kwargs.get('mean_before_spike_removal_dark', True))
-
+                             mean_before_spike_removal_dark=kwargs.get('mean_before_spike_removal_dark', True))
 
         self._filter_img(kwargs.get('img_median_filter_kernel', [5,3,5]), 
                          kwargs.get('spikes_threshold', 1.4))
@@ -886,14 +892,14 @@ class DLS_Image(RIXS_Image):
                         hdf5_path_to_dark=None,
                         dark_median_filter_kernel_size=[5,15], 
                         dark_smoothing_parameters=[3,15], filtertype='gaussian', 
-                        mean_before_spike_removal_dark=True,
-                        index_start_fit_bkg=1192):
+                        mean_before_spike_removal_dark=True):
         
-        file_path_dark = file_path_dark if isinstance(file_path_dark, list) else [file_path_dark]
+        
         if dark_from_processed_file:
             self.dark_img = self._get_processed_dark_img(file_path_dark,
                                                         hdf5_path_to_dark)
         else:
+            file_path_dark = file_path_dark if isinstance(file_path_dark, list) else [file_path_dark]
             dark_img_raw, _ = self._get_dark_img_from_nxs(file_path_dark) #loading the dark images
             self._filter_and_smooth_dark_image(dark_img_raw,
                                                 kernel_size = dark_median_filter_kernel_size, 
@@ -901,11 +907,11 @@ class DLS_Image(RIXS_Image):
                                                 filtertype=filtertype,
                                                 mean_before_spike_removal_dark=mean_before_spike_removal_dark)
 
-        #fit the dark image to the raw_data
-        self.fit_bkg_sklearn(index_start_fit_bkg=index_start_fit_bkg)
-        self.subtract_dark()
+        # #fit the dark image to the raw_data
+        # self._fit_bkg_sklearn(index_start_fit_bkg=index_start_fit_bkg)
+        # self._subtract_dark()
+        # print("Dark image processed successfully.")
 
-        print("Dark image processed successfully.")
         
 
     @staticmethod
@@ -917,7 +923,7 @@ class DLS_Image(RIXS_Image):
         Default path is ["dark_no_spikes_filtered"].
         """
 
-        print(f"Using dark image from hdf file {dark_hdf5_filename}. \n No processing done. \n")
+        print(f"Using dark image from hdf file {dark_hdf5_filename}. \nNo processing done. \n")
         #get dark from a hdf file
         with h5py.File(dark_hdf5_filename, "r") as f:
             if path_to_dark is None:
@@ -1254,14 +1260,14 @@ class DLS_Image(RIXS_Image):
         to avoid including the signal region in the background fit.
         """
 
-        print(f"Fitting background to spectrum.")
         start_time = time.perf_counter()
 
         chunk_bkg = self.dark_img[index_start_fit_bkg:-100, :].reshape(-1,1)
 
         model = LinearRegression(copy_X=True)
 
-        for num_image in range(0,self.imgs_pure.shape[0]):
+        self.dark_poly = np.zeros((2,self.raw_data.shape[0])) #initializing the array
+        for num_image in range(0,self.raw_data.shape[0]):
             # Flatten the matrices
             img_flat = self.raw_data[num_image,index_start_fit_bkg:-100,:].reshape(-1,1)
 
@@ -1275,6 +1281,7 @@ class DLS_Image(RIXS_Image):
         end_time = time.perf_counter()
         
         elapsed_time = end_time - start_time
+        print(f"Fitting completed. Scale factor: {self.dark_poly[0]}, Offset: {self.dark_poly[1]}")
         print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
 
     def _fit_bkg(self):
@@ -1344,16 +1351,17 @@ class DLS_Image(RIXS_Image):
             print("Using median_filter of scipy.ndimage.")
             img_corr_med = median_filter(self.raw_data, size=(min(self.raw_data.shape[0], 5), 
                                                                img_median_filter_kernel[1], img_median_filter_kernel[2])) #applying the median filter
-            spikes = (self.raw_data - img_corr_med) / self.data_count_time #getting the spikes
+            spikes = (self.raw_data - img_corr_med) / self.data_count_time[:, None, None] #getting the spikes
             self.imgs_processed = np.where(spikes>spikes_threshold, img_corr_med ,self.raw_data) #filtering the spikes
 
             print("Found these spikes per image: ", end="")
             for spike_2d in spikes:
                 count = np.sum(spike_2d>spikes_threshold)
                 print(f"{count}, ", end="")
-            print("\n")
+            print("\n", end="")
         else:
             print(f"No spike removal.")
+            self.imgs_processed = self.raw_data.copy()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -1439,5 +1447,162 @@ class DLS_Image(RIXS_Image):
         elapsed_time = end_time - start_time
         print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
 
+
+    def plot_generation(self, use_spc=True, **kwargs):
+        if not use_spc:
+            # Figure 1: Dark image profiles
+            plt.figure(figsize=(10,3))
+            
+            # Panel 1: Dark image profiles
+            plt.subplot(131)
+            plt.imshow(self.raw_data.mean(axis=0),
+                    vmin=self.raw_data[:,:,:].mean()-1*self.raw_data[:,:,:].std(),
+                        vmax=self.raw_data[:,:,:].mean()+3*self.raw_data[:,:,:].std(),cmap = cm.lipari)
+            # plt.imshow(self.imgs_processed.mean(axis=0),
+            #         vmin=self.imgs_processed[:,:,:].mean()-1*self.imgs_processed[:,:,:].std(),
+            #             vmax=self.imgs_processed[:,:,:].mean()+3*self.imgs_processed[:,:,:].std(),cmap = 'gray')
+            mean_img = self.imgs_processed.mean(axis=0)
+            # max_coos = tuple(np.unravel_index(np.nanargmax(mean_img), mean_img.shape))
+            ny, nx = self.imgs_processed.shape[1], self.imgs_processed.shape[2]
+            x = np.arange(nx)
+            curve_a = kwargs.get('curve_a', 0)
+            curve_b = kwargs.get('curve_b', 0)
+            y = curve_a * (x) + curve_b * (x)**2 - curve_a * (nx) - curve_b * (nx)**2 + kwargs.get('index_start_fit_bkg', 1192) - 100
+            y = np.clip(y, 0, ny - 1)
+            ax = plt.gca()
+            plt.plot(x, y, color='r', linestyle='--', linewidth=0.8)
+            index_start = int(kwargs.get('index_start_fit_bkg', 1192))
+            ax.axhline(index_start, color='darkgreen', linestyle='--', linewidth=1)
+            plt.title("Mean raw image")
+            plt.colorbar(label='Counts')
+            plt.xlabel("X (pixel)")
+            plt.ylabel("Y (pixel)")
+
+            # Panel 2: Mean spectrum near elastic line
+            plt.subplot(132)
+            plt.plot(self.raw_data[0,:,:].mean(axis=1),color="k", label='Image profile')
+            plt.plot(self.dark_img.mean(axis=1), color='darkgreen', label='Dark profile (filtered)')
+            plt.plot(self.dark_poly[0,0]*self.dark_img.mean(axis=1) + self.dark_poly[1,0],color="r", label='Dark profile (scaled)')
+            plt.xlabel("Pixel ")
+            plt.ylabel("Counts")
+            plt.legend()
+            plt.title(f"Scaling parameters: A={self.dark_poly[0,0]:.4f}, B={self.dark_poly[1,0]:.4f}")
+
+            # Plot up to 5 spectra (vertical profiles) from imgs_processed with different colors
+            n_images_total = self.imgs_processed.shape[0] 
+            n_to_plot = min(5, n_images_total)
+
+            # pick indices evenly spaced through the available images
+            if n_images_total == 1:
+                indices = [0]
+            else:
+                indices = np.linspace(0, n_images_total - 1, n_to_plot).astype(int).tolist()
+
+            colors = cm.managua(np.linspace(0, 1, max(5, n_to_plot)))
+            plt.subplot(133)
+            for i, idx in enumerate(indices):
+                img = self.imgs_processed[idx]
+                spectrum = img.mean(axis=1)  # vertical profile (mean over X)
+                plt.plot(spectrum, color=colors[i], label=f"Image {idx}")
+
+            plt.xlabel("Pixel ")
+            plt.ylabel("Counts")
+            plt.title("Selected RIXS spectra")
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+
+    def get_dark_img_from_nxs(self): #backround
+        """
+        Loads and processes dark images from NeXus files.
+
+        This method:
+        1. Loads dark images from specified run numbers (self.dark_img_run)
+        2. Converts images to float type
+        3. Averages multiple dark images if present
+        4. Accumulates total counting time
+
+        The processed data is stored in:
+        - self.dark_img: Averaged dark image array
+        - self.count_time: Total counting time for dark images
+
+        Raises
+        ------
+        Exception
+            If dark image files cannot be found or loaded
+        """
+        print(f"Retrieving dark images from run(s) {self.dark_img_run}.")
+        start_time = time.perf_counter()
+
+        for dark_img_run_loop in self.dark_img_run.tolist():
+
+            filename = self.find(dark_img_run_loop,self.directory_dark)
+            print(f"Retrieving dark image from file {filename}")
+
+            with nxload(filename,mode='r') as f: #loading background
+                try:
+                    self.dark_img = np.concatenate((self.dark_img, f.entry['andor']['data'].nxvalue))
+                except:
+                    self.dark_img = np.concatenate((self.dark_img, f.entry1['andor']['data'].nxvalue))
+
+                try:
+                    self.dark_count_time += f.entry['instrument']['m4c1']['count_time'].nxvalue #count time
+                except:
+                    try:
+                        self.dark_count_time += f.entry1['instrument']['m4c1']['count_time'].nxvalue
+                    except:
+                        self.dark_count_time += 180
+
+        self.dark_img = self.dark_img.astype(float)
+        #self.dark_img = self.dark_img.mean(axis=0)
+
+        print(f"Total number of dark images retrieved: {self.dark_img.shape[0]}")
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
+
+    def get_dawn_spectrum(self, normalized=True):
+        """
+        Retrieves the spectrum data processed by DAWN from a processed NeXus file.
+        
+        Parameters
+        ----------
+        normalized : bool, default=True
+            If True, returns the normalized spectrum data
+            If False, returns the raw spectrum data
+            
+        Returns
+        -------
+        tuple
+            (energyLoss, spectrum) where:
+            - energyLoss: array of energy loss values
+            - spectrum: array of spectrum intensity values
+            
+        Notes
+        -----
+        The data is retrieved from different paths in the NeXus file structure:
+        - Normalized data: '.../normalized_correlated_spectrum_0'
+        - Raw data: '.../correlated_spectrum_0'
+        """
+        filename = self.find(self.runNB,self.directory, processed=True)
+        with nxload(filename,mode='r') as f:
+            if normalized:
+                try:
+                    energyLoss = f.processed.summary['1-Combined RIXS image reduction']['normalized_correlated_spectrum_0']['Energy loss'].nxvalue
+                    spectrum = f.processed.summary['1-Combined RIXS image reduction']['normalized_correlated_spectrum_0'].data.nxvalue
+                except:
+                    energyLoss = f.processed.summary['1-RIXS image reduction']['normalized_correlated_spectrum_0']['Energy loss'].nxvalue
+                    spectrum = f.processed.summary['1-RIXS image reduction']['normalized_correlated_spectrum_0'].data.nxvalue
+            else:
+                try:
+                    energyLoss = f.processed.summary['1-Combined RIXS image reduction']['correlated_spectrum_0']['Energy loss'].nxvalue
+                    spectrum = f.processed.summary['1-Combined RIXS image reduction']['correlated_spectrum_0'].data.nxvalue       
+                except:
+                    energyLoss = f.processed.summary['1-RIXS image reduction']['correlated_spectrum_0']['Energy loss'].nxvalue
+                    spectrum = f.processed.summary['1-RIXS image reduction']['correlated_spectrum_0'].data.nxvalue
+                    
+        return energyLoss, spectrum
 
 
