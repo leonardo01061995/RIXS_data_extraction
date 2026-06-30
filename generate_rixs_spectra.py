@@ -1,22 +1,20 @@
 import os
 import time
 import h5py
-import numpy as np
-from scipy.signal import fftconvolve
-import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import correlate
-from scipy.interpolate import RegularGridInterpolator as rgi
-from cmcrameri import cm
-from abc import ABC, abstractmethod
 import fabio
 import fnmatch
-from nexusformat.nexus import *
+import numpy as np
+import matplotlib.pyplot as plt
 import xarray as xr
+
+from scipy.ndimage import gaussian_filter1d
+from scipy.interpolate import RegularGridInterpolator as rgi
+from cmcrameri import cm
+from nexusformat.nexus import *
 
 from rixs_images import EDF_Image, TPS_Image, DLS_Image
 from one_d_rixs_spectra import Generated_1D_RIXS_Spectra
-      
+from static_functions import calculate_shift_new, _find_aligning_range, _find_curvature
 
 class RIXS_Raw_Images:
     def __init__(
@@ -320,7 +318,6 @@ class RIXS_Raw_Images:
             raise ValueError("If find_aligning_range is False, both pixel_row_start and pixel_row_stop must be provided.")
         
         self.ds_1d = xr.Dataset()
-        processed_images = []
         # Determine axis names
         y_name = "Photons" if use_spc else "Counts"
         if self.facility == "ESRF":
@@ -366,7 +363,6 @@ class RIXS_Raw_Images:
 
             raw_imgs.append(img)
 
-            #save each spectrum inside a xarray dataarray. All the spectra from different runs will be saved inside ds xarray dataset
             for i, rixs_2d in enumerate(img.imgs_processed):
 
                 # Create x, y, norm arrays as 1D vectors
@@ -396,27 +392,38 @@ class RIXS_Raw_Images:
             
             # img.normalization_factor is an array (one value per sub-image); extend the list with its elements
             self.normalization_factors.extend(np.asarray(img.normalization_factor).tolist())
-            if keep_2d_images or align_images_by_shifting_photons:
-                processed_images.append(img.imgs_processed)
 
-        processed_images = np.stack(processed_images, axis=0)  # Shape: (n_images, n_rows, n_cols)
+            if keep_2d_images or align_images_by_shifting_photons:
+                if run_index == 0 :
+                    n_images = len(img.imgs_processed)
+                    img_height = img.imgs_processed[0].shape[0]
+                    img_width = img.imgs_processed[0].shape[1]
+                    processed_images = np.zeros((n_images, img_height, img_width))
+                else:
+                    processed_images = np.concatenate((processed_images, np.stack(img.imgs_processed, axis=0)), axis=0)
+
+        self.one_d_processed_spectra = np.stack(self.one_d_processed_spectra, axis=0)
+        n_spectra_tot = self.one_d_processed_spectra.shape[0]
         self.normalization_factors = np.stack(self.normalization_factors)
         mean_normalization_factor = np.mean(self.normalization_factors)
         std_normalization_factor = np.std(self.normalization_factors)
         print(f"Normalization factor: {mean_normalization_factor} +- {std_normalization_factor}")
         print(f"Total elapsed time for spectrum generation: {time.perf_counter() - start_time:.2f} seconds. \n")
 
-        if self.align_images and len(self.one_d_processed_spectra) > 1:
+        if keep_2d_images and self.align_images and n_spectra_tot > 1:
             print("Calculating energy correlation and aligning images. 2D images will be stored in memory.", end="\n\n")
             if find_aligning_range:
-                self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(processed_images, threshold=0.1)
+                self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(processed_images.mean(axis=0).mean(axis=1), threshold=0.1)
             else:
                 self.pixel_row_start = pixel_row_start
                 self.pixel_row_stop = pixel_row_stop
 
             ###### ONly calculate the shift: then re-bin each image
-            self._calculate_shift(self.pixel_row_start, self.pixel_row_stop, process_shifts=process_shifts,
-                            correlation_batch_size=correlation_batch_size, poly_order=poly_order)
+            self.calculate_shift_new(processed_images.mean(axis=-1),
+                                     aligning_range = (self.pixel_row_start, self.pixel_row_stop), 
+                                     process_shifts=process_shifts,
+                                     correlation_batch_size=correlation_batch_size, 
+                                     poly_order=poly_order)
 
             if use_spc and align_images_by_shifting_photons:
                 ###### now re-bin the images if you used single-photon counting
@@ -443,105 +450,16 @@ class RIXS_Raw_Images:
             self.all_imgs_processed = processed_images
 
 
-        elif self.align_images and len(self.one_d_processed_spectra) == 1:
+        elif self.align_images and n_spectra_tot == 1:
             print("Only one file found. No energy correlation necessary.")
             self.all_imgs_processed = processed_images
         else:
             print("Aligning images is disabled. No energy correlation will be performed.")
             if keep_2d_images:
-                # self.ds_2d = xr.Dataset()
-                # #save the imgs from processed_imgs, and the attributes from the rixs_img objects
-                # for ii, (img_2d, img_object) in enumerate(zip(processed_images, raw_imgs)):
-                #     da = xr.DataArray(
-                #         img_2d,
-                #         dims=['points', 'variable'],
-                #         coords={"points": np.arange(x.shape[0]),
-                #                 'variable': ['x', 'y', 'norm']},
-                #         attrs={
-                #             **getattr(img_object, "attributes", {}),
-                #             **additional_metadata,
-                #             "x_name": 'Pixel',
-                #             "y_name": y_name,
-                #             "norm_name": norm_name,
-                #             'run_number': img_object.run_number,
-                #         }
-                #     )
-                #     self.ds_2d[f"{ii}"] = da.copy()
-                self.imgs_imgs_processed = processed_images
-            
-
-        #old code for alignment
-        # ########## Alignment, but only for single-photon counting images if wanted
-        # if self.align_images and len(self.one_d_processed_spectra) > 1 and use_spc and align_images_by_shifting_photons: 
-        #     #correct the shift
-        #     if find_aligning_range:
-        #         self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(threshold=0.1)
-        #     else:
-        #         self.pixel_row_start = pixel_row_start
-        #         self.pixel_row_stop = pixel_row_stop
-
-        #     ###### ONly calculate the shift: then re-bin each image
-        #     self._calculate_shift(self.pixel_row_start, self.pixel_row_stop, fit_shifts, 
-        #                     correlation_batch_size, poly_order)
-               
-        #     ###### now re-bin the images if you used single-photon counting
-        #     print("Re-binning images with known shifts by vertically shifting photons.")
-        #     processed_images = []
-        #     for i,img in enumerate(processed_images):
-        #             processed_images.append(img.single_photon_counting(
-        #                 **spc_parameters,
-        #                 vertical_shift = self.shifts[i])[0])         
-
-        # elif self.align_images and img.n_images == 1: 
-        #     print("Only one file found. No energy correlation necessary.")
-        # # else:
-        # #     print("Aligning images is disabled. No energy correlation will be performed.")
+                self.imgs_processed = processed_images
 
         return Generated_1D_RIXS_Spectra(self.ds_1d)
-
-
-    def _find_aligning_range(processed_images, threshold=0.1):
-        """
-        Find the position of the first significant peak in the image spectrum.
-        Uses a moving average to smooth the data and identifies where signal rises
-        above background.
-        
-        Parameters
-        ----------
-        window_size : int, optional
-            Size of the moving average window for smoothing, default 5
-        threshold : float, optional
-            Threshold value above which signal is considered significant,
-            as fraction of maximum intensity, default 0.1
-            
-        Returns
-        -------
-        tuple
-            A tuple containing the start and stop indices of the interval around the significant peak in the image spectrum.
-        """
-
-        print("Attempting to find the range around the elastic line...")
-        
-        spectrum = processed_images.mean(axis=0).mean(axis=1)
-        # Find where signal rises above threshold * max intensity
-        threshold_value = threshold * np.max(spectrum)
-        # Calculate the moving average with a window of 3
-        moving_avg = np.convolve(spectrum, np.ones(3)/3, mode='same')
-        peak_start = np.where(moving_avg > threshold_value)[0]
-        
-        if len(peak_start) == 0:
-            raise ValueError("No peak found above threshold")
-        
-        # Use the last peak position (elastic line) instead of first peak
-        elastic_line = peak_start[-1]
-        range_start = elastic_line - 100
-        range_stop = elastic_line + 15
-        
-        print(f"Using range: {range_start}, {range_stop}")
-        
-        # Return the range around the elastic line
-        return range_start, range_stop
-    
+   
 
     def plot_image_and_spectra(self, plot_image=True, plot_spectra=True, plot_shifts=True):
         """
@@ -707,116 +625,6 @@ class RIXS_Raw_Images:
 
         return ds_2d
 
-
-    def _calculate_shift(self, pixel_row_start, pixel_row_stop, 
-                         process_shifts='', correlation_batch_size=1, poly_order=1):
-
-        """
-        correct_shift2 method
-
-        This method applies the calculated shifts to the images stored in the 
-        all_imgs_processed attribute. It iterates through each image, checking the 
-        magnitude of the shift. If the shift exceeds a threshold (0.5 in this 
-        case), it performs interpolation to adjust the image based on the 
-        calculated shift. If the shift is within the threshold, the original 
-        image is directly assigned to the imgs_lc attribute without modification. 
-        The method also tracks and prints the elapsed time for the operation.
-
-        Returns
-        -------
-        None
-        """
-
-        print(f"Calculating energy shift of {self.all_imgs_processed.shape[0]} images.")
-        start_time = time.perf_counter()
-
-        # Initialize arrays
-        self.shifts = np.zeros(self.all_imgs_processed.shape[0])
-        self.real_shifts = self.shifts.copy()
-        
-        #pre-average the images to have a more reliable cross-correlation
-        #spec_avg has shape: (all_imgs_processed.shape[1], all_imgs_processed.shape[0]//batch_size + reminder)
-        spec_avg = self.average_images_in_batches(self.all_imgs_processed, min(correlation_batch_size, self.all_imgs_processed.shape[0]))
-        
-        # Get reference spectrum once (avoid recomputing for each iteration)
-        ref_spectrum = spec_avg[:,0]
-
-        real_shifts = np.zeros(spec_avg.shape[1])
-        # Calculate the shift for the remaining images
-        for num_image in range(1, spec_avg.shape[1]):
-            # Get current spectrum
-            curr_spectrum = spec_avg[:,num_image]
-            
-            # Calculate shift
-            real_shifts[num_image] = self.correlate_spectra(
-                curr_spectrum, ref_spectrum, pixel_row_start, pixel_row_stop)
-
-        # index_aux = range(0, self.all_imgs_processed.shape[0], correlation_batch_size)
-        index_aux = np.arange(0, self.all_imgs_processed.shape[0], correlation_batch_size)[:self.all_imgs_processed.shape[0] // correlation_batch_size]
-
-        if process_shifts=='fit':
-            coeffs = np.polyfit(index_aux, real_shifts, deg=poly_order)
-            self.shifts = np.polyval(coeffs, range(0, self.all_imgs_processed.shape[0]))
-        elif process_shifts=='smooth':
-            # Extrapolate by specifying left and right values
-            self.shifts = np.interp(range(0, self.all_imgs_processed.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1])          
-            sigma = correlation_batch_size   # Adjust sigma based on correlation_batch_size
-            self.shifts = gaussian_filter1d(self.shifts, sigma=sigma)
-        else:
-            self.shifts = np.interp(range(0, self.all_imgs_processed.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1]) 
-
-
-        print("Shifting images by: ", end="")
-        for i in range(len(self.shifts)):
-            print(f"{self.shifts[i]:.2f}, ", end="")
-        print("\n")
-            
-        #save the real shifts somewhere for plotting
-        for i in range(0, real_shifts.shape[0]):
-            self.real_shifts[i*correlation_batch_size:(i+1)*correlation_batch_size] = real_shifts[i]
-            
-        print("")
-        end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
-
-
-    @staticmethod
-    def _find_curvature(im,frangex,frangey, plotting=False, deg=2):
-        """
-        Analyze the curvature of the given image data within specified x and y ranges.
-
-        Parameters
-        ----------
-        im : numpy.ndarray
-            A 2D array representing the image data to be analyzed.
-        frangex : list or tuple
-            A range of x-coordinates (start, end) to consider for the analysis.
-        frangey : list or tuple
-            A range of y-coordinates (start, end) to consider for the analysis.
-        plotting : bool, optional
-            If True, generates plots for visual inspection of the reference and cross-correlation results. Default is False.
-        deg : int, optional
-            The degree of the polynomial to fit to the shifts. Default is 2 (quadratic fit).
-
-        Returns
-        -------
-        None
-            The method prints the extracted curvature coefficients and stores them in the instance variable `self.curv`.
-        """
-        ref=np.ones([frangey[1]-frangey[0],im[:,:].shape[0]]) * im[frangey[0]:frangey[1],frangex[0]:frangex[1]].mean(axis=1)[:,np.newaxis]
-        crosscorr=fftconvolve(im[frangey[0]-100:frangey[1]+100,:],ref[::-1,:],axes=0)
-        if plotting==True:
-            f,ax=plt.subplots(2)
-            ax[0].plot(ref[:,5])
-            ax[0].plot(ref[:,10])
-            for i in np.arange(frangex[0],frangex[1],10):
-                ax[1].plot(crosscorr[:,i])
-        shifts=np.argmax(crosscorr,axis=0)
-        curv=np.polyfit(np.arange(im[:,:].shape[0]),shifts,deg=deg)
-        print(f"Extracted curvature: f{curv}")
-
-        return curv[1], curv[0]
     
     @staticmethod
     def load_dark_image(filename, dataset_name):
@@ -838,79 +646,7 @@ class RIXS_Raw_Images:
             dark_image = f[dataset_name][:]
         
         return dark_image
-
-    @staticmethod
-    def correlate_spectra(spec, spec_ref, pixel_start, pixel_stop):
-        """
-        this function correlates two spectra and returns the lag value to be used for shifting the images
-
-        params:
-        spec: the spectrum to be shifted
-        spec_ref: the reference spectrum
-        pixel_start: the starting pixel
-        pixel_stop: the stopping pixel
-
-        return:
-        lag: the lag value to be used for shifting the images
-        """
-        # Ensure spec and spec_ref are 1D arrays
-        if spec.ndim != 1 or spec_ref.ndim != 1:
-            raise ValueError("Both spec and spec_ref must be 1D arrays.")
-
-        factor = 2  # Change this value as needed
-
-        # Ensure pixel_start and pixel_stop are within bounds
-        if pixel_start < 0 or pixel_stop >= len(spec):
-            raise ValueError("pixel_start and pixel_stop must be within the bounds of the spectrum.")
-
-        if factor == 1:
-            # Skip interpolation if factor is 1
-            xx = np.arange(pixel_start, pixel_stop + 1)
-            spec = spec[xx]  # Use the original spectrum directly
-            spec_ref = spec_ref[xx]  # Use the original reference spectrum directly
-        else:
-            xx = np.arange(pixel_start, pixel_stop + 1 / factor, 1 / factor)
-            spec = np.interp(xx, np.arange(0, len(spec)), spec)  # Interpolating the spectrum
-            spec_ref = np.interp(xx, np.arange(0, len(spec_ref)), spec_ref)  # Interpolating the reference spectrum
-
-        crosscorr = correlate(spec, spec_ref)
-        lag_values = np.arange(-spec.shape[0] + 1, spec.shape[0], 1)
-        lag = lag_values[np.argmax(crosscorr)] / factor
-
-        return lag
     
-    @staticmethod
-    def average_images_in_batches(imgs, batch_size):
-        """
-        Averages images in batches from a 3D array.
-
-        Parameters
-        ----------
-        imgs : 3D array[float]
-            Array containing the images stacked along the first axis
-        max_lc_images : int
-            Maximum number of low-count images to consider for averaging
-
-        Returns
-        -------
-        averaged_imgs : 3D array[float]
-            Array containing the 1D RIXS spectra stacked along the second axis
-        """
-        n_images = imgs.shape[0]
-        
-        if batch_size == 0:
-            raise ValueError("Batch size must be greater than zero. Consider increasing max_lc_images.")
-        
-        n_batches = n_images // batch_size
-        averaged_spectra = np.zeros((imgs.shape[1], n_batches))
-
-        for i in range(n_batches):
-            start_index = i * batch_size
-            end_index = start_index + batch_size
-            averaged_img = np.mean(imgs[start_index:end_index, :, :], axis=0)
-            averaged_spectra[:,i] = averaged_img.mean(axis=1)        
-
-        return averaged_spectra
     
     def _calculate_energy_axis(self,calibration, auto_alignment, index_elastic_line=None):
         """
@@ -950,6 +686,7 @@ class RIXS_Raw_Images:
 
         return energy_loss 
     
+
     def save_pre_processed_dataset(self, path_dir=None, filename_save_auto=True, filename_save = '', auto_alignment=True, index_elastic_line=None):
         if self.facility == "ESRF":
             self.save_pre_processed_dataset_ESRF(path_dir, filename_save_auto, filename_save)

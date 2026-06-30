@@ -1,14 +1,15 @@
+import os
+import time
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
-import os
-import time
+import pandas as pd
 from scipy.signal import correlate
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 from cmcrameri import cm
 from IPython.display import display
-import pandas as pd
+from static_functions import calculate_shift_new, _find_aligning_range
 
 
 
@@ -26,10 +27,10 @@ class Generated_1D_RIXS_Spectra:
 
 
     def align_spectra(self,
-                        pixel_row_start=None,
-                        pixel_row_stop=None,
+                        aligning_range = None,
                         fit_shifts=False,
                         smooth_shifts=False,
+                        interp_shifts=False,
                         correlation_batch_size=10,
                         poly_order=1,
                         plot=False,):
@@ -37,10 +38,8 @@ class Generated_1D_RIXS_Spectra:
         Process the extracted spectra to align energy shifts and calculate average spectrum.
         Parameters
         ----------
-        pixel_row_start : int
-            Starting pixel row for the correlation region (typically near elastic line).
-        pixel_row_stop : int
-            Ending pixel row for the correlation region (typically near elastic line).
+        aligning_range : tuple
+            A tuple specifying the pixel row range for alignment (start, stop).
         fit_shifts : bool
             Whether to fit the shifts to a polynomial function.
         smooth_shifts : bool
@@ -53,13 +52,16 @@ class Generated_1D_RIXS_Spectra:
             Whether to plot the processed spectra.
         """
 
-      
         # Find aligning range using the _find_aligning_range method
-        if pixel_row_start is None or pixel_row_stop is None:
-            self.pixel_row_start, self.pixel_row_stop = self._find_aligning_range(self.spectra_xarray, threshold=0.1)
+        if aligning_range is None:
+            # Extract the first x-axis, stack all y_data arrays along a new dimension
+            x_data = self.spectra_xarray[list(self.spectra_xarray.data_vars)[0]].sel(variable='x').values
+            all_y_data = np.stack([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
+            avg_spectrum = np.mean(all_y_data, axis=0)
+            self.pixel_row_start, self.pixel_row_stop = _find_aligning_range(avg_spectrum, x_data=x_data, threshold=0.1)
         else:
-            self.pixel_row_start = pixel_row_start
-            self.pixel_row_stop = pixel_row_stop
+            self.pixel_row_start = aligning_range[0]
+            self.pixel_row_stop = aligning_range[1]
 
         # Stack all y_data arrays along a new dimension
         all_y_data = np.stack([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
@@ -72,13 +74,20 @@ class Generated_1D_RIXS_Spectra:
             self.spectra_xarray[spec_name].attrs['pixel_row_start'] = self.pixel_row_start
             self.spectra_xarray[spec_name].attrs['pixel_row_stop'] = self.pixel_row_stop
 
-        ### correct the energy shifts
-        _ = self._correct_shift(all_y_data, 
-                                self.pixel_row_start, self.pixel_row_stop, 
-                                fit_shifts=fit_shifts, 
-                                smooth_shifts=smooth_shifts,
-                                correlation_batch_size=correlation_batch_size, 
-                                poly_order=poly_order)     
+        # ── Calculate shifts ──────────────────────────
+        self.shifts, self.real_shifts, self.real_shifts_batches_1round = calculate_shift_new(all_y_data,
+                                                                                             aligning_range=(self.pixel_row_start, self.pixel_row_stop),
+                                                                                             fit_shifts=fit_shifts,
+                                                                                             smooth_shifts=smooth_shifts,
+                                                                                             interp_shifts=interp_shifts,
+                                                                                             correlation_batch_size=correlation_batch_size,
+                                                                                             poly_order=poly_order)      
+
+
+        # ── Correct shift ─────────────────────────────
+        for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):          
+                self.spectra_xarray[spec_name].loc[dict(variable='x')] -= self.shifts[num_spectrum]
+                print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
                    
         if plot:
             self.plot_spectra(True, pixel_row_start=self.pixel_row_start, pixel_row_stop=self.pixel_row_stop)
@@ -231,8 +240,9 @@ class Generated_1D_RIXS_Spectra:
         if align_spectra:
             plt.figure(figsize=(11,6))
             plt.subplot(2,1,1)
-            plt.plot(self.real_shifts, 'ko-', label='Real Shifts')  # 'ko-' for black circles connected by lines
-            plt.plot(self.shifts, 'ro-', label='Used Shifts')
+            plt.plot(self.real_shifts_batches_1round, 'bo-', label='Real Shifts (1st round)')  # 'bo-' for blue circles connected by lines
+            plt.plot(self.real_shifts - self.real_shifts[0], 'ko-', label='Real Shifts')  # 'ko-' for black circles connected by lines
+            plt.plot(self.shifts - self.real_shifts[0], 'ro-', label='Used Shifts')
             plt.xlabel('Image Index')
             plt.ylabel('Shift Value')
             plt.title('Real Shifts of Images')
@@ -301,53 +311,6 @@ class Generated_1D_RIXS_Spectra:
         plt.tight_layout()
         plt.show()
 
-
-    @staticmethod
-    def _find_aligning_range(spectra_xarray, threshold=0.05):
-        """
-        Find the position of the first significant peak in the image spectrum.
-        Uses a moving average to smooth the data and identifies where signal rises
-        above background.
-        
-        Parameters
-        ----------
-        window_size : int, optional
-            Size of the moving average window for smoothing, default 5
-        threshold : float, optional
-            Threshold value above which signal is considered significant,
-            as fraction of maximum intensity, default 0.1
-            
-        Returns
-        -------
-        tuple
-            A tuple containing the start and stop indices of the interval around the significant peak in the image spectrum.
-        """
-        
-        print("Attempting to find the range around the elastic line...")
-
-        # Extract the first x-axis, stack all y_data arrays along a new dimension
-        x_data = spectra_xarray[list(spectra_xarray.data_vars)[0]].sel(variable='x').values
-        all_y_data = np.stack([spectra_xarray[spec].sel(variable='y').values for spec in spectra_xarray.data_vars], axis=0)
-        avg_spectrum = np.mean(all_y_data, axis=0)
-
-        # Find where signal rises above threshold * max intensity
-        threshold_value = threshold * np.max(avg_spectrum)
-        # Calculate the moving average with a window of 3
-        moving_avg = np.convolve(avg_spectrum, np.ones(3)/3, mode='same')
-        peak_start = np.where(moving_avg > threshold_value)[0]
-        
-        if len(peak_start) == 0:
-            raise ValueError("No peak found above threshold")
-        
-        # Use the last peak position (elastic line) instead of first peak
-        elastic_line = peak_start[-1]
-        range_start = elastic_line - 50
-        range_stop = elastic_line + 15
-        
-        print(f"Using range: {range_start}, {range_stop} (x_data: {x_data[range_start]:.2f}, {x_data[range_stop]:.2f})")
-        
-        # Return the range around the elastic line
-        return range_start, range_stop
     
     
     def calibrate_energy(self, auto_elastic_determination=False, elastic_line_point=None, calibration=1):
@@ -404,242 +367,6 @@ class Generated_1D_RIXS_Spectra:
 
             print(f"Elastic line energy point set to {elastic_line_point}, calibration factor {calibration} eV/pixel.")
 
-
-    def _correct_shift(self, spectra, pixel_row_start, pixel_row_stop, 
-                       fit_shifts, smooth_shifts, correlation_batch_size, poly_order):
-        """
-        Corrects energy shifts between spectra by aligning them to the first spectrum.
-
-        The alignment is performed by:
-        1. Computing cross-correlation between each spectrum and the first spectrum
-        2. Finding the optimal shift that maximizes correlation
-        3. Applying the shift correction using interpolation
-        4. Storing the shift values for each spectrum
-
-        Parameters
-        ----------
-        pixel_row_start : int
-            Starting pixel row for the correlation region (typically near elastic line)
-        pixel_row_stop : int 
-            Ending pixel row for the correlation region (typically near elastic line)
-        """
-        print(f"Calculating energy shifts of {spectra.shape[0]} spectra. Shifting spectra by: ")
-        start_time = time.perf_counter()
-
-        # Initialize arrays
-        self.shifts = np.zeros(spectra.shape[0])
-        self.real_shifts = self.shifts.copy()
-        self.corrected_spectra = np.zeros_like(spectra)
-        
-        # Pre-average the spectra to have a more reliable cross-correlation
-        if correlation_batch_size > 1:
-            spec_avg = self._average_images_in_batches(spectra, np.min((correlation_batch_size, spectra.shape[0])))
-        else:
-            spec_avg = spectra.copy()
-
-        # Get reference spectrum once (avoid recomputing for each iteration)
-        ref_spectrum = spec_avg[0, :]
-
-        real_shifts = np.zeros(spec_avg.shape[0])
-        # Calculate the shift for the remaining spectra
-        for num_spectrum in range(1, spec_avg.shape[0]):
-
-            # Get current spectrum
-            curr_spectrum = spec_avg[num_spectrum, :]
-            
-            # Calculate shift
-            real_shifts[num_spectrum] = self._correlate_spectra(
-                curr_spectrum, ref_spectrum, pixel_row_start, pixel_row_stop)
-
-        index_aux = np.arange(0, spectra.shape[0], correlation_batch_size)[:spectra.shape[0] // correlation_batch_size]
-        if fit_shifts:
-            coeffs = np.polyfit(index_aux, real_shifts, deg=poly_order)
-            self.shifts = np.polyval(coeffs, range(0, spectra.shape[0]))
-        elif smooth_shifts:
-            # Extrapolate by specifying left and right values
-            self.shifts = np.interp(range(0, spectra.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1])          
-            sigma = correlation_batch_size   # Adjust sigma based on correlation_batch_size
-            self.shifts = gaussian_filter1d(self.shifts, sigma=sigma)
-        else:
-            self.shifts = np.interp(range(0, spectra.shape[0]), index_aux, real_shifts, left=real_shifts[0], right=real_shifts[-1]) 
-
-        # Round all the shifts to the nearest integer
-        # self.shifts = np.round(self.shifts)        
-         
-        # Save the real shifts somewhere for plotting
-        for i in range(0, real_shifts.shape[0]):
-            self.real_shifts[i * correlation_batch_size:(i + 1) * correlation_batch_size] = real_shifts[i]
-
-        # for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
-        #     if abs(self.shifts[num_spectrum]) > 0.4:
-        #         print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
-                
-        #         # Interpolate
-        #         interp = np.interp(
-        #             np.arange(spectra.shape[1]) - self.shifts[num_spectrum], 
-        #             np.arange(spectra.shape[1]), 
-        #             spectra[num_spectrum, :],
-        #             left=0, right=0
-        #         )
-                
-        #         self.spectra_xarray[spec_name].loc[dict(variable='y')] = interp.copy()
-        #     else:
-        #         self.shifts[num_spectrum] = 0
-        #         print("0.00, ", end="")
-
-        # for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
-        #     # Approximate self.shifts[num_spectrum] to the closest half-integer
-        #     self.shifts[num_spectrum] = round(self.shifts[num_spectrum] * 2) / 2
-
-        #     if abs(self.shifts[num_spectrum]) > 0.1:
-        #         # Interpolate
-        #         interp = np.interp(
-        #             np.arange(spectra.shape[1]) - self.shifts[num_spectrum], 
-        #             np.arange(spectra.shape[1]), 
-        #             spectra[num_spectrum, :],
-        #             left=0, right=0
-        #         )
-            
-        #         self.spectra_xarray[spec_name].loc[dict(variable='y')] = interp.copy()
-
-        for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
-            # Approximate self.shifts[num_spectrum] to the closest half-integer            
-                self.spectra_xarray[spec_name].loc[dict(variable='x')] -= self.shifts[num_spectrum]
-                print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
-
-        print("")
-        end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
-
-    def _correlate_spectra(self, spec, spec_ref, pixel_start, pixel_stop):
-        """
-        this function correlates two spectra and returns the lag value to be used for shifting the images
-
-        params:
-        spec: the spectrum to be shifted
-        spec_ref: the reference spectrum
-        pixel_start: the starting pixel
-        pixel_stop: the stopping pixel
-
-        return:
-        lag: the lag value to be used for shifting the images
-        """
-        # Ensure spec and spec_ref are 1D arrays
-        if spec.ndim != 1 or spec_ref.ndim != 1:
-            raise ValueError("Both spec and spec_ref must be 1D arrays.")
-
-        factor = 2  # Change this value as needed
-
-        # Ensure pixel_start and pixel_stop are within bounds
-        if pixel_start < 0 or pixel_stop >= len(spec):
-            raise ValueError("pixel_start and pixel_stop must be within the bounds of the spectrum.")
-
-        if factor == 1:
-            # Skip interpolation if factor is 1
-            xx = np.arange(pixel_start, pixel_stop + 1)
-            spec = spec[xx]  # Use the original spectrum directly
-            spec_ref = spec_ref[xx]  # Use the original reference spectrum directly
-        else:
-            xx = np.arange(pixel_start, pixel_stop + 1 / factor, 1 / factor)
-            spec = np.interp(xx, np.arange(0, len(spec)), spec)  # Interpolating the spectrum
-            spec_ref = np.interp(xx, np.arange(0, len(spec_ref)), spec_ref)  # Interpolating the reference spectrum
-
-        crosscorr = correlate(spec/np.mean(spec), spec_ref/np.mean(spec_ref))
-        lag_values = np.arange(-spec.shape[0] + 1, spec.shape[0], 1)
-        lag = lag_values[np.argmax(crosscorr)] / factor
-
-        # if factor > 1:
-        #     # xx = np.arange(0, len(spec_ref) + 1 / factor, 1 / factor)
-        #     xx = np.linspace(0, len(spec_ref)-1, (len(spec_ref) - 1) * factor + 1)
-        #     spec = np.interp(xx, np.arange(0, len(spec)), spec)  # Interpolating the spectrum
-        #     spec_ref = np.interp(xx, np.arange(0, len(spec_ref)), spec_ref)  # Interpolating the reference spectrum
-
-        # lag_values, crosscorr = self._custom_cross_correlation(spec, spec_ref, int(pixel_start*factor), int(pixel_stop*factor))
-        # crosscorr_restricted = crosscorr[(lag_values >= -10) & (lag_values <= 10)]
-        # first_index = np.argmax(lag_values >= -10)
-        # lag = (lag_values[np.argmax(crosscorr_restricted)] + first_index) / factor
-
-        return lag
-
-    @staticmethod
-    def _custom_cross_correlation(g, f, window_start, window_end):
-        """
-        Cross-correlate f and g, evaluating only within [window_start:window_end] of f.
-        The shifted g always uses its full values (not zero-padded).
-        
-        Returns:
-            lags: array of lag values
-            correlations: correlation value at each lag
-        """
-        
-        f = np.asarray(f)
-        g = np.asarray(g)
-
-        N = len(f)
-        M = len(g)
-
-        window_indices = np.arange(window_start, window_end)
-        norm_f = np.linalg.norm(f[window_indices])
-        lags = np.arange(-M + 1, N)  # All possible lags
-        
-        correlations = []
-
-        for lag in lags:
-            # Shift g by lag (positive lag: shift right)
-            g_shifted = np.zeros_like(f)
-            # if lag==0:
-            #     print("ciao")
-            for i in range(N):
-                g_idx = i - lag  # reverse of convolution
-                if 0 <= g_idx < M:
-                    # if g_idx == 160:
-                    #     print('ciao')
-                    g_shifted[i] = g[g_idx]
-            
-            # Compute dot product only inside the window
-            norm_g = np.linalg.norm(g_shifted[window_indices])
-            if norm_g == 0:
-                correlations.append(0)
-                continue
-            dot = np.dot(f[window_indices]/norm_f, g_shifted[window_indices]/norm_g)
-            correlations.append(dot)
-
-        return lags, np.array(correlations)
-
-
-    @staticmethod
-    def _average_images_in_batches(spectra, batch_size):
-        """
-        Averages images in batches from a stack of 1D spectra.
-
-        Parameters
-        ----------
-        imgs : 3D array[float]
-            Array containing the images stacked along the first axis
-        max_lc_images : int
-            Maximum number of low-count images to consider for averaging
-
-        Returns
-        -------
-        averaged_imgs : 3D array[float]
-            Array containing the 1D RIXS spectra stacked along the second axis
-        """
-        n_images = spectra.shape[0]
-        
-        if batch_size == 0:
-            raise ValueError("Batch size must be greater than zero. Consider increasing max_lc_images.")
-        
-        n_batches = n_images // batch_size
-        averaged_spectra = np.zeros((n_batches, spectra.shape[1]))
-
-        for i in range(n_batches):
-            start_index = i * batch_size
-            end_index = start_index + batch_size
-            averaged_spectra[i,:] = np.mean(spectra[start_index:end_index, :], axis=0)       
-
-        return averaged_spectra
-    
 
 
 
