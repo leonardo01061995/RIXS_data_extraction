@@ -284,6 +284,270 @@ class RIXS_Image(ABC):
             )
             print(SpotHIGH)
 
+        img = img - bkg_mean
+
+        gs = 2
+        h = gs // 2  # = 1
+        cp = np.argwhere(
+            (img[h:-h, h:-h] > low_th_px)
+            * (img[h:-h, h:-h] < high_th_px)
+        ) + np.array([h, h])
+
+        if len(cp) == 0:
+            return [], []
+
+        # --- vectorized patch extraction ---
+        # offsets: [-1, 0, 1]
+        offsets = np.arange(-h, h + 1)
+        dy, dx = np.meshgrid(offsets, offsets, indexing='ij')   # (3, 3)
+
+        patch_y = cp[:, 0, None, None] + dy[None]               # (N, 3, 3)
+        patch_x = cp[:, 1, None, None] + dx[None]               # (N, 3, 3)
+
+        spots = img[patch_y, patch_x]                           # (N, 3, 3)
+        spots_clipped = np.maximum(spots, 0)                    # clip negatives
+
+        # --- local maximum check ---
+        # center pixel must be >= every neighbor in the clipped patch
+        center_vals = img[cp[:, 0], cp[:, 1]]                   # (N,)
+        is_local_max = (spots_clipped > center_vals[:, None, None]).sum(axis=(1, 2)) == 0  # (N,)
+
+        # --- weighted centroid ---
+        # x-centroid: weight each x-column by the column sum (sum over rows)
+        # y-centroid: weight each y-row   by the row   sum (sum over cols)
+        x_weights = spots_clipped.sum(axis=1)                   # (N, 3)  sum over rows
+        y_weights = spots_clipped.sum(axis=2)                   # (N, 3)  sum over cols
+
+        x_coords = cp[:, 1, None] + offsets[None]              # (N, 3)
+        y_coords = cp[:, 0, None] + offsets[None]              # (N, 3)
+
+        total_weight = spots_clipped.sum(axis=(1, 2))           # (N,)
+        safe_weight = np.where(total_weight > 0, total_weight, 1)
+
+        mx = (x_coords * x_weights).sum(axis=1) / safe_weight  # (N,)
+        my = (y_coords * y_weights).sum(axis=1) / safe_weight  # (N,)
+        my = my - (curve_a + curve_b * mx) * mx                # curvature correction
+
+        # --- event classification ---
+        spot_sums = total_weight
+        single_mask = is_local_max & (spot_sums > SpotLOW) & (spot_sums <= SpotHIGH)
+        double_mask = is_local_max & (spot_sums > SpotHIGH)
+
+        my_single = my[single_mask]
+        mx_single = mx[single_mask]
+        my_double = my[double_mask]
+        mx_double = mx[double_mask]
+
+        # doubles are appended twice to res (same behaviour as the original loop)
+        res_my = np.concatenate([my_single, my_double, my_double])
+        res_mx = np.concatenate([mx_single, mx_double, mx_double])
+
+        res_shifted    = list(zip(res_my    + 0.5, res_mx    + 0.5))
+        double_shifted = list(zip(my_double + 0.5, mx_double + 0.5))
+
+        return res_shifted, double_shifted
+
+    @staticmethod
+    def _centroid_parallel(
+        imgs,
+        energy,
+        bkg_mean=0,
+        factor_ADC=1.2,
+        factor_for_ghost_clouds=0,
+        avoid_double=False,
+        curve_a=0,
+        curve_b=0,
+    ):
+        """
+        Vectorized single photon counting for a stack of images.
+        Processes all images simultaneously without an explicit Python loop.
+        Patches are always 2D: candidate pixels are compared only to neighbours
+        within the same image.
+
+        Parameters
+        ----------
+        imgs : ndarray, shape (N_img, H, W)
+            Stack of 2D detector images.
+        energy : float
+            Energy of the incident photons in eV.
+        bkg_mean : float, optional
+            Flat background level to subtract.
+        factor_ADC : float, optional
+            ADU-to-electron conversion factor.
+        factor_for_ghost_clouds : float, optional
+            Lower bound for SpotLOW (use > 0 to discard ghost clouds, e.g. 200 for TPS).
+        avoid_double : bool, optional
+            If True, SpotHIGH is set to infinity (double events are kept as singles).
+        curve_a, curve_b : float, optional
+            Linear/quadratic curvature correction coefficients.
+
+        Returns
+        -------
+        res_list : list of ndarray, each shape (M_i, 2)
+            One array per input image.  Each row is (y + 0.5, x + 0.5) of a
+            detected photon (doubles counted twice, consistent with _centroid).
+        double_list : list of ndarray, each shape (D_i, 2)
+            Double-event positions for each image.
+        """
+        SpotLOW  = max(0.4 * energy / 3.6 / factor_ADC, factor_for_ghost_clouds)
+        SpotHIGH = 1.5 * energy / 3.6 / factor_ADC
+        low_th_px  = 0.2 * energy / 3.6 / factor_ADC
+        high_th_px = 1.0 * energy / 3.6 / factor_ADC
+
+        if avoid_double:
+            SpotHIGH = 1e9
+
+        imgs = imgs - bkg_mean          # (N_img, H, W)  — does not modify original
+        n_imgs = imgs.shape[0]
+        h = 1                           # half patch-size → 3×3 patches
+
+        # ------------------------------------------------------------------ #
+        # 1. Candidate pixels                                                 #
+        # ------------------------------------------------------------------ #
+        # mask shape: (N_img, H-2, W-2)
+        inner = imgs[:, h:-h, h:-h]
+        mask  = (inner > low_th_px) & (inner < high_th_px)
+
+        # cp: (N_cand, 3)  columns → [img_idx, y, x]
+        cp = np.argwhere(mask) + np.array([0, h, h])
+
+        empty_res    = [np.empty((0, 2)) for _ in range(n_imgs)]
+        empty_double = [np.empty((0, 2)) for _ in range(n_imgs)]
+
+        if len(cp) == 0:
+            return empty_res, empty_double
+
+        img_idx = cp[:, 0]              # (N,)
+        cy      = cp[:, 1]              # (N,)
+        cx      = cp[:, 2]              # (N,)
+
+        # ------------------------------------------------------------------ #
+        # 2. Vectorized 3×3 patch extraction                                 #
+        # ------------------------------------------------------------------ #
+        offsets = np.arange(-h, h + 1)                          # [-1, 0, 1]
+        dy, dx  = np.meshgrid(offsets, offsets, indexing='ij')  # (3, 3)
+
+        patch_y = cy[:, None, None]      + dy[None]             # (N, 3, 3)
+        patch_x = cx[:, None, None]      + dx[None]             # (N, 3, 3)
+        patch_i = img_idx[:, None, None] * np.ones((1, 3, 3), dtype=np.intp)  # (N, 3, 3)
+
+        spots         = imgs[patch_i, patch_y, patch_x]         # (N, 3, 3)
+        spots_clipped = np.maximum(spots, 0)
+
+        # ------------------------------------------------------------------ #
+        # 3. Local-maximum check (within the same image's patch)             #
+        # ------------------------------------------------------------------ #
+        center_vals = imgs[img_idx, cy, cx]                      # (N,)
+        is_local_max = (
+            (spots_clipped > center_vals[:, None, None]).sum(axis=(1, 2)) == 0
+        )                                                        # (N,)
+
+        # ------------------------------------------------------------------ #
+        # 4. Weighted centroid                                                #
+        # ------------------------------------------------------------------ #
+        x_weights    = spots_clipped.sum(axis=1)                 # (N, 3)  sum over rows
+        y_weights    = spots_clipped.sum(axis=2)                 # (N, 3)  sum over cols
+        x_coords     = cx[:, None] + offsets[None]              # (N, 3)
+        y_coords     = cy[:, None] + offsets[None]              # (N, 3)
+        total_weight = spots_clipped.sum(axis=(1, 2))            # (N,)
+        safe_weight  = np.where(total_weight > 0, total_weight, 1)
+
+        mx = (x_coords * x_weights).sum(axis=1) / safe_weight   # (N,)
+        my = (y_coords * y_weights).sum(axis=1) / safe_weight   # (N,)
+        my = my - (curve_a + curve_b * mx) * mx                 # curvature correction
+
+        # ------------------------------------------------------------------ #
+        # 5. Event classification                                             #
+        # ------------------------------------------------------------------ #
+        single_mask = is_local_max & (total_weight > SpotLOW) & (total_weight <= SpotHIGH)
+        double_mask = is_local_max & (total_weight > SpotHIGH)
+
+        # ------------------------------------------------------------------ #
+        # 6. Build per-image output lists                                     #
+        # ------------------------------------------------------------------ #
+        res_list    = []
+        double_list = []
+
+        for i in range(n_imgs):
+            in_img = img_idx == i
+
+            s_mask = in_img & single_mask
+            d_mask = in_img & double_mask
+
+            my_s, mx_s = my[s_mask], mx[s_mask]
+            my_d, mx_d = my[d_mask], mx[d_mask]
+
+            # doubles appended twice (same convention as _centroid)
+            res_my = np.concatenate([my_s, my_d, my_d])
+            res_mx = np.concatenate([mx_s, mx_d, mx_d])
+
+            res_list.append(
+                np.column_stack([res_my + 0.5, res_mx + 0.5]) if len(res_my) > 0
+                else np.empty((0, 2))
+            )
+            double_list.append(
+                np.column_stack([my_d + 0.5, mx_d + 0.5]) if len(my_d) > 0
+                else np.empty((0, 2))
+            )
+
+        return res_list, double_list
+
+    @staticmethod
+    def _centroid_old(
+        img,
+        energy,
+        bkg_mean=0,
+        factor_ADC=1.2,
+        factor_for_ghost_clouds = 0,
+        avoid_double=False,
+        curve_a=0,
+        curve_b=0,
+    ):
+        """
+        Parameters
+        ----------
+        img : ndarray
+            2D detector image array containing photon hit data
+        energy : float
+            Energy of the incident photons in eV
+        bkg_mean : float, optional
+            Mean value of the flat background to subtract from image, default 300.52
+        factor_ADC : float, optional
+            Factor to convert ADU to electrons, default 0.56 (TPS uses electron-multiplied CCD)
+        factor_for_ghost_clouds : float, optional
+            Factor to discard ghost clouds, only present at TPS. If present, should be 200. For, ESRF, 0.
+        factor_SpotLOW : float, optional
+            Multiplication factor for low threshold (i.e. selects electron clouds whose sum is above this limit), default 0.4.
+            This factor is 0.4 at ESRF, but here we need to discard this strange clouds and need to be set above 200
+        avoid_double : bool, optional
+            If True, ignore double photon events. If False or None, include them
+        image_size : tuple of int
+            Size of the 2D detector image as (height, width)
+        subdivide_bins_factor_x : float, optional
+            Factor by which to subdivide each pixel along x-axis for sub-pixel resolution, default 1.0
+        subdivide_bins_factor_y : float, optional
+            Factor by which to subdivide each pixel along y-axis for sub-pixel resolution, default 1.0
+
+        Returns
+        -------
+        tuple
+            (hist_p, photon_count) where:
+            - hist_p is the 2D histogram of photon positions with sub-pixel resolution
+            - photon_count is the total number of detected photons
+        """
+
+        SpotLOW = max(0.4 * energy / 3.6 / factor_ADC, factor_for_ghost_clouds)  # Multiplication factor * ADU/photon
+        SpotHIGH = 1.5 * energy / 3.6 / factor_ADC  # Multiplication factor * ADU/photon
+        low_th_px = 0.2 * energy / 3.6 / factor_ADC  # Multiplication factor * ADU/photon
+        high_th_px = 1 * energy / 3.6 / factor_ADC  # Multiplication factor * ADU/photon
+
+        if avoid_double == True:
+            SpotHIGH = 100000
+            print(
+                "The double events are not taken into account, the double event threshold is set to "
+            )
+            print(SpotHIGH)
+
 
         img = img - bkg_mean
 
@@ -374,6 +638,23 @@ class RIXS_Image(ABC):
             photon_count = len(p_pos_array)
 
         return hist_p.astype(np.float32), photon_count
+
+
+class H5_ESRF_Image(RIXS_Image):
+    def __init__(self, file_path):
+        """
+        Initialize an HDF5 image object from a file path.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the HDF5 image file
+        """
+
+        super().__init__()
+        self.file_path = file_path
+        
+
 
 
 class EDF_Image(RIXS_Image):
