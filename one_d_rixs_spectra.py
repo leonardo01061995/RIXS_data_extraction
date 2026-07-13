@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import numpy as np
 import xarray as xr
@@ -9,12 +10,12 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 from cmcrameri import cm
 from IPython.display import display
-from static_functions import calculate_shift_new, _find_aligning_range
+from static_functions import calculate_shift_new, calculate_shift_mccc,  _find_aligning_range, check_variations_parameters
 
 
 
 class Generated_1D_RIXS_Spectra:
-    def __init__(self, ds):
+    def __init__(self, ds, energy_axis_calculated=False):
         """
         Class to handle 1D RIXS spectra generated from 2D RIXS images.
         To be used with xarray datasets generated either by extract_rixs_spectra.py or by generate_rixs_spectra.py
@@ -24,6 +25,12 @@ class Generated_1D_RIXS_Spectra:
             The xarray Dataset containing the 1D RIXS spectra.
         """
         self.spectra_xarray = ds
+        self.energy_axis_calculated = energy_axis_calculated
+        check_variations_parameters(self.spectra_xarray,
+                        attributes_to_exclude=["x_name", "y_name", "norm_name", 
+                                            "filename", "date", "run", "scan",
+                                            "pixel_row_start", "pixel_row_stop", "mirror"], 
+                                threshold=0.1)
 
 
     def align_spectra(self,
@@ -52,13 +59,31 @@ class Generated_1D_RIXS_Spectra:
             Whether to plot the processed spectra.
         """
 
+        if (fit_shifts and smooth_shifts) or (fit_shifts and interp_shifts) or (smooth_shifts and interp_shifts):
+            raise ValueError("Cannot use multiple options to post-process shifts at the same time. Please choose one.")
+        
         # Find aligning range using the _find_aligning_range method
+        print("\n-> Aligning spectra using cross-correlation.")
         if aligning_range is None:
             # Extract the first x-axis, stack all y_data arrays along a new dimension
             x_data = self.spectra_xarray[list(self.spectra_xarray.data_vars)[0]].sel(variable='x').values
             all_y_data = np.stack([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
             avg_spectrum = np.mean(all_y_data, axis=0)
-            self.pixel_row_start, self.pixel_row_stop = _find_aligning_range(avg_spectrum, x_data=x_data, threshold=0.1)
+
+            #check if there are multiple runs. if so, enlarge the aligning range
+            runs = []
+            for spec_name in self.spectra_xarray.data_vars:
+                run = self.spectra_xarray[spec_name].attrs.get('run', '?')
+                runs.append(run)
+
+            multiple_runs = False
+            if '?' in runs:
+                multiple_runs = True
+            else:
+                multiple_runs = len(set(runs)) > 1
+
+            self.pixel_row_start, self.pixel_row_stop = _find_aligning_range(avg_spectrum, x_data=x_data,
+                                                                             threshold=0.1, extended_range=multiple_runs)
         else:
             self.pixel_row_start = aligning_range[0]
             self.pixel_row_stop = aligning_range[1]
@@ -66,48 +91,89 @@ class Generated_1D_RIXS_Spectra:
         # Stack all y_data arrays along a new dimension
         all_y_data = np.stack([self.spectra_xarray[spec].sel(variable='y').values for spec in self.spectra_xarray.data_vars], axis=0)
         if all_y_data.shape[0] == 1:
-            print("Only one spectrum found. Skipping alignment.")
+            print("\tOnly one spectrum found. Skipping alignment.")
             return
 
         #save the pixel_row_start, pixel_row_stop and sample name inside the spectra_xarrays
         for spec_name in self.spectra_xarray.data_vars:
-            self.spectra_xarray[spec_name].attrs['pixel_row_start'] = self.pixel_row_start
-            self.spectra_xarray[spec_name].attrs['pixel_row_stop'] = self.pixel_row_stop
+            self.spectra_xarray[spec_name].attrs['alignment_range'] = np.array([self.pixel_row_start, self.pixel_row_stop])
 
         # ── Calculate shifts ──────────────────────────
-        self.shifts, self.real_shifts, self.real_shifts_batches_1round = calculate_shift_new(all_y_data,
+        # self.shifts, self.real_shifts, self.real_shifts_batches_1round = calculate_shift_new(all_y_data,
+        #                                                                                      aligning_range=(self.pixel_row_start, self.pixel_row_stop),
+        #                                                                                      fit_shifts=fit_shifts,
+        #                                                                                      smooth_shifts=smooth_shifts,
+        #                                                                                      interp_shifts=interp_shifts,
+        #                                                                                      correlation_batch_size=correlation_batch_size,
+        #                                                                                      poly_order=poly_order)      
+        self.shifts, self.real_shifts, self.real_shifts_batches_1round = calculate_shift_mccc(all_y_data,
                                                                                              aligning_range=(self.pixel_row_start, self.pixel_row_stop),
                                                                                              fit_shifts=fit_shifts,
                                                                                              smooth_shifts=smooth_shifts,
                                                                                              interp_shifts=interp_shifts,
                                                                                              correlation_batch_size=correlation_batch_size,
-                                                                                             poly_order=poly_order)      
+                                                                                             poly_order=poly_order)  
+
+        #shifts, real_shifts and real_shifts_batches1 are in sub-pixels (points), but the x-axis
+        #is in pixels
+        spec_name = list(self.spectra_xarray.data_vars)[0]
+        x_axis = self.spectra_xarray[spec_name].sel(variable='x').values
+        subpixel_factor = x_axis[1] - x_axis[0]
+        self.shifts, self.real_shifts, self.real_shifts_batches_1round = self.shifts * subpixel_factor, self.real_shifts * subpixel_factor, self.real_shifts_batches_1round * subpixel_factor
 
 
         # ── Correct shift ─────────────────────────────
         for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):          
                 self.spectra_xarray[spec_name].loc[dict(variable='x')] -= self.shifts[num_spectrum]
-                print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
+                # print(f"{self.shifts[num_spectrum]:.2f}, ", end="")
+        
+        self.spectra_xarray.attrs['log'] += f"\nSpectra aligned using cross-correlation with aligning range: {self.pixel_row_start}-{self.pixel_row_stop} \
+                                            , grouped in batches of size {correlation_batch_size}."
+        if smooth_shifts:
+            self.spectra_xarray.attrs['log'] += f"\nShifts smoothed using Gaussian filter with sigma = {correlation_batch_size}"
+        elif interp_shifts:
+            self.spectra_xarray.attrs['log'] += f"\nShifts interpolated using linear interpolation."
+        elif fit_shifts:
+            self.spectra_xarray.attrs['log'] += f"\nShifts fitted using polynomial of order {poly_order}."
+        else:
+            self.spectra_xarray.attrs['log'] += f"\nShifts applied without smoothing, interpolation, or fitting."
+        
                    
         if plot:
-            self.plot_spectra(True, pixel_row_start=self.pixel_row_start, pixel_row_stop=self.pixel_row_stop)
+            self.plot_spectra(True, pixel_row_start=self.pixel_row_start, pixel_row_stop=self.pixel_row_stop,
+                              correlation_batch_size=correlation_batch_size)
+
+            
 
     def save_to_hdf5(self, file_path_save, 
-                     save_avg_spectrum=False):
+                     save_only_avg_spectrum=False,
+                     normalize_spectra=False,
+                     divide_normalization_by_value=1,
+                     variable_names = [],
+                     additional_metadata={},
+                     metadata_to_save = None):
         """
         Save the spectra to an HDF5 file.
         """
+        args_to_pass = dict(
+            filename=file_path_save,
+            normalize_spectra=normalize_spectra,
+            divide_normalization_by_value=divide_normalization_by_value,
+            variable_names=variable_names,
+            additional_metadata=additional_metadata,
+            metadata_to_save=metadata_to_save
+        )
         if file_path_save is None:
             raise ValueError("file_path_save must be defined when save_to_hdf5 is True.")
-        if save_avg_spectrum:
+        if save_only_avg_spectrum:
             if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
                 ds_avg = self.calculate_average_spectrum()
-                RIXS_Spectra(ds=ds_avg).save_to_hdf5(file_path_save)
+                RIXS_Spectra(ds=ds_avg).save_to_hdf5(**args_to_pass)
             else:
-                RIXS_Spectra(ds=self.avg_spectrum_xr_dataset).save_to_hdf5(file_path_save)
-            print("Only the average spectrum was saved to the HDF5 file.")
+                RIXS_Spectra(ds=self.avg_spectrum_xr_dataset).save_to_hdf5(**args_to_pass)
+            print("\tOnly the average spectrum was saved to the HDF5 file.")
         else:
-            RIXS_Spectra(ds=self.spectra_xarray).save_to_hdf5(file_path_save)
+            RIXS_Spectra(ds=self.spectra_xarray).save_to_hdf5(**args_to_pass)
             
 
     def save_to_csv_for_originlab(self, 
@@ -134,14 +200,14 @@ class Generated_1D_RIXS_Spectra:
         Save the spectra to a text file.
         """ 
         if file_path_save is None:
-            raise ValueError("file_path_save must be defined when save_to_tx is True.")
+            raise ValueError("file_path_save must be defined when save_to_txt is True.")
         if save_avg_spectrum:
             ds_avg = self.calculate_average_spectrum()
             RIXS_Spectra(ds=ds_avg).save_to_txt(file_path_save, save_avg_spectrum=save_avg_spectrum)
         else:
             RIXS_Spectra(ds=self.spectra_xarray).save_to_txt(file_path_save, save_avg_spectrum=save_avg_spectrum)
 
-    def calculate_average_spectrum(self):
+    def calculate_average_spectrum(self, poisson_error=True):
         """
         Calculate the average spectrum from the extracted spectra.
         """
@@ -151,6 +217,7 @@ class Generated_1D_RIXS_Spectra:
         # Calculate the average spectrum
         runs = []
         scans = []
+        # all_y_values = []
         for num_spectrum, (spec_name, _) in enumerate(self.spectra_xarray.items()):
             if num_spectrum == 0:
                 avg_spectrum = self.spectra_xarray[spec_name].sel(variable='y').values.copy()
@@ -166,7 +233,10 @@ class Generated_1D_RIXS_Spectra:
                 scans.append(self.spectra_xarray[spec_name].attrs.get('scan', '?'))
                 other_attrs = {key: value for key, value in self.spectra_xarray[spec_name].attrs.items() 
                                if key not in ["x_name", "y_name", "norm_name", "filename", "date", "run", "scan",
-                                              "pixel_row_start", "pixel_row_stop"]}
+                                              "pixel_row_start", "pixel_row_stop","alignment_range", "mirror"]}
+                
+                # all_y_values = avg_spectrum.reshape(1, -1)  # Initialize all_y_values with the first spectrum's y-values
+                all_y_values = [avg_spectrum]
 
             else:
                 x_axis = self.spectra_xarray[spec_name].sel(variable='x').values
@@ -177,72 +247,72 @@ class Generated_1D_RIXS_Spectra:
                         spec_now,
                         left=0, right=0
                     )
-            
+                # all_y_values = np.vstack((all_y_values, interp))  # Append the interpolated y-values to all_y_values
+                all_y_values.append(interp)
+
                 avg_spectrum += interp
                 norm += self.spectra_xarray[spec_name].sel(variable='norm').values
                 runs.append(self.spectra_xarray[spec_name].attrs.get('run', '?'))
                 scans.append(self.spectra_xarray[spec_name].attrs.get('scan', '?'))
-                for key, value in other_attrs.items():
-                    if key in self.spectra_xarray[spec_name].attrs:
-                        current_value = self.spectra_xarray[spec_name].attrs[key]
-                        if isinstance(current_value, (int, float)) and isinstance(value, (int, float)):
-                            # Perform numeric comparison
-                            if abs(current_value - value) > 0.1:
-                                print(f"******Warning******: Attribute '{key}' differs by more than 0.1 between spectra. "
-                                    f"Value in current spectrum: {current_value}, "
-                                    f"Value in other_attrs: {value}")
-                        else:
-                            # Perform string comparison
-                            if str(current_value) != str(value):
-                                print(f"******Warning******: Attribute '{key}' differs between spectra. "
-                                    f"Value in current spectrum: {current_value}, "
-                                    f"Value in other_attrs: {value}")
+
+        all_y_values = np.stack(all_y_values, axis=0)  # Convert the list of arrays to a 2D array
+
+        if poisson_error:
+            error = np.sqrt(avg_spectrum)
+        else:
+            error = np.std(all_y_values, axis=0)
 
         # Create the DataArray with multiple coordinates for the 'points' dimension
-        data = np.stack([x_axis_0, avg_spectrum, norm], axis=1)
+        data = np.stack([x_axis_0, avg_spectrum, error, norm], axis=1)
         
         avg_spectrum_xr = xr.DataArray(
             data=data,
             dims=['points', 'variable'],
             coords={
             'points': np.arange(data.shape[0]),
-            'variable': ['x', 'y', 'norm']
+            'variable': ['x', 'y', 'error', 'norm']
             }
         )
+        avg_spectrum_xr.attrs['log'] = self.spectra_xarray.attrs.get('log', '') + "\nAverage spectrum calculated from the extracted spectra."
+        avg_spectrum_xr.attrs['mirror'] = np.mean(norm)
         avg_spectrum_xr.attrs['x_name'] = x_name
         avg_spectrum_xr.attrs['y_name'] = y_name
         avg_spectrum_xr.attrs['norm_name'] = norm_name
         avg_spectrum_xr.attrs['filename'] = filename
-        avg_spectrum_xr.attrs['run'] = runs
+        avg_spectrum_xr.attrs['run'] = '_'.join(dict.fromkeys(runs))
         avg_spectrum_xr.attrs['scan'] = scans
         avg_spectrum_xr.attrs['date'] = date
-        avg_spectrum_xr.attrs['pixel_row_start'] = self.pixel_row_start
-        avg_spectrum_xr.attrs['pixel_row_stop'] = self.pixel_row_stop
+        avg_spectrum_xr.attrs['alignment_range'] = np.array([self.pixel_row_start, self.pixel_row_stop])
         
         # Add other attributes
         for key, value in other_attrs.items():
             avg_spectrum_xr.attrs[key] = value
 
+        
         self.avg_spectrum_xr_dataset = xr.Dataset()
         self.avg_spectrum_xr_dataset['avg_spectrum'] = avg_spectrum_xr.copy()
         del avg_spectrum_xr
 
         return self.avg_spectrum_xr_dataset.copy(deep=True)
 
-    def plot_spectra(self, align_spectra=False, pixel_row_start=None, pixel_row_stop=None):
+    def plot_spectra(self, align_spectra=False, pixel_row_start=None, pixel_row_stop=None, 
+                     correlation_batch_size=1):
         """
         Plot the extracted spectra.
+        Spectra are grouped into consecutive batches of size `correlation_batch_size`;
+        the mean spectrum of each batch is displayed (up to 5 batches, evenly spaced
+        across the full spectra list).
         """
         if not hasattr(self, 'spectra_xarray'):
             raise ValueError("No spectra have been extracted. Please run extract_1d_runs or process_spectra first.")
         
         #shifts
         if align_spectra:
-            plt.figure(figsize=(11,6))
-            plt.subplot(2,1,1)
-            plt.plot(self.real_shifts_batches_1round, 'bo-', label='Real Shifts (1st round)')  # 'bo-' for blue circles connected by lines
-            plt.plot(self.real_shifts - self.real_shifts[0], 'ko-', label='Real Shifts')  # 'ko-' for black circles connected by lines
-            plt.plot(self.shifts - self.real_shifts[0], 'ro-', label='Used Shifts')
+            plt.figure(figsize=(11,7))
+            plt.subplot(2,2,1)
+            plt.plot(self.real_shifts_batches_1round, 'ko-', label='Shifts (1 round)')  # 'g^-' for green triangles connected by lines
+            plt.plot(self.real_shifts, 'ro-', label='Shifts (2 round)')  # 'ko-' for black circles connected by lines
+            plt.plot(self.shifts, 'o-', color='orange',  label='Used Shifts')
             plt.xlabel('Image Index')
             plt.ylabel('Shift Value')
             plt.title('Real Shifts of Images')
@@ -259,7 +329,7 @@ class Generated_1D_RIXS_Spectra:
                 integrals.append(np.sum(y_vals[i0:i1+1]))
 
             # Plot integrals in the second subplot
-            plt.subplot(2, 1, 2)
+            plt.subplot(2, 2, 2)
             plt.plot(integrals, 'bo-', label='Integrated intensity')
             plt.axhline(np.mean(integrals), color='k', linestyle='--', label='Mean')
             plt.xlabel('Image Index')
@@ -268,16 +338,51 @@ class Generated_1D_RIXS_Spectra:
             plt.grid()
             plt.legend()
 
-            plt.show()
+            # plt.tight_layout()
+            # plt.show()
 
-        max_spectra = 10
-        spectra_to_plot = list(self.spectra_xarray.items())[::max(1, len(self.spectra_xarray) // max_spectra)]
-        color_list = [cm.managua(i) for i in np.linspace(0, 1, len(spectra_to_plot))]
-        plt.figure(figsize=(11,3))
-        plt.subplot(1, 2, 1)
-        for i, (spec_name, spec_data) in enumerate(spectra_to_plot):
-            plt.plot(spec_data.sel(variable='x')+self.shifts[i], 
-                    spec_data.sel(variable='y'), label=spec_name, color=color_list[i])
+        all_items = list(self.spectra_xarray.items())
+        n_total = len(all_items)
+        batch_size = max(1, correlation_batch_size)
+
+        # Group spectra into consecutive batches of size `batch_size`
+        batch_slices = [slice(start, min(start + batch_size, n_total)) for start in range(0, n_total, batch_size)]
+
+        # Pick up to 5 batches, evenly spaced across the full list of batches
+        max_batches = 5
+        batches_to_plot = batch_slices[::max(1, len(batch_slices) // max_batches)]
+        color_list = [cm.managua(i) for i in np.linspace(0, 1, len(batches_to_plot))]
+
+        def _batch_mean(x_arrays, y_arrays):
+            """Interpolate all y_arrays onto the first spectrum's x-axis and average them."""
+            x_ref = x_arrays[0]
+            y_mean = y_arrays[0].copy()
+            for x_i, y_i in zip(x_arrays[1:], y_arrays[1:]):
+                y_mean = y_mean + np.interp(x_ref, x_i, y_i, left=0, right=0)
+            y_mean = y_mean / len(y_arrays)
+            return x_ref, y_mean
+
+        def _clean_label(name):
+            """Remove 'run' and 'scan' substrings (case-insensitive) from a spectrum name to keep legends short."""
+            cleaned = re.sub(r'(?i)run|scan', '', str(name))
+            return cleaned.strip('_- ')
+
+        # plt.figure(figsize=(11,3))
+        # initialize a two-element list so we can assign axes by index without IndexError
+        self.plot_alignment = [None, None]
+        self.plot_alignment[0] = plt.subplot(2, 2, 3)
+        for i, sl in enumerate(batches_to_plot):
+            batch_items = all_items[sl]
+            x_arrays = [spec_data.sel(variable='x').values + self.shifts[j]
+                        for j, (_, spec_data) in zip(range(sl.start, sl.stop), batch_items)]
+            y_arrays = [spec_data.sel(variable='y').values for (_, spec_data) in batch_items]
+            x_batch, y_batch = _batch_mean(x_arrays, y_arrays)
+            label = _clean_label(batch_items[0][0]) if len(batch_items) == 1 else f"{_clean_label(batch_items[0][0])}\u2013{_clean_label(batch_items[-1][0])}"
+            plt.plot(x_batch, y_batch, label=label, color=color_list[i])
+        spec_name = all_items[-1][0]
+        if pixel_row_start is not None and pixel_row_stop is not None:
+            plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_start], color='k', linestyle='--')
+            plt.axvline(x=self.spectra_xarray[spec_name].sel(variable='x')[pixel_row_stop], color='k', linestyle='--')
         plt.xlabel(self.spectra_xarray[spec_name].attrs.get('x_name', 'x'))
         plt.ylabel(self.spectra_xarray[spec_name].attrs.get('y_name', 'y'))
         plt.title('Raw spectra')
@@ -285,10 +390,14 @@ class Generated_1D_RIXS_Spectra:
         plt.legend()
         plt.tight_layout()
 
-        plt.subplot(1, 2, 2)
-        for i, (spec_name, spec_data) in enumerate(spectra_to_plot):
-            plt.plot(spec_data.sel(variable='x'), 
-                    spec_data.sel(variable='y'), label=spec_name, color=color_list[i])
+        self.plot_alignment[1] = plt.subplot(2, 2, 4)
+        for i, sl in enumerate(batches_to_plot):
+            batch_items = all_items[sl]
+            x_arrays = [spec_data.sel(variable='x').values for (_, spec_data) in batch_items]
+            y_arrays = [spec_data.sel(variable='y').values for (_, spec_data) in batch_items]
+            x_batch, y_batch = _batch_mean(x_arrays, y_arrays)
+            label = _clean_label(batch_items[0][0]) if len(batch_items) == 1 else f"{_clean_label(batch_items[0][0])}\u2013{_clean_label(batch_items[-1][0])}"
+            plt.plot(x_batch, y_batch, label=label, color=color_list[i])
 
         if not hasattr(self, 'avg_spectrum_xr_dataset') or self.avg_spectrum_xr_dataset is None:
             ds_avg = self.calculate_average_spectrum()
@@ -308,12 +417,14 @@ class Generated_1D_RIXS_Spectra:
         plt.legend()
         plt.title('Aligned spectra')
         plt.grid()
+        
         plt.tight_layout()
-        plt.show()
+        # plt.show()
 
     
     
-    def calibrate_energy(self, auto_elastic_determination=False, elastic_line_point=None, calibration=1):
+    def calibrate_energy(self, auto_elastic_determination=False, elastic_line_point=None, calibration=1,
+                         plot=False):
         """
         Set the elastic line energy point and apply calibration to the spectra.
         Parameters
@@ -329,16 +440,19 @@ class Generated_1D_RIXS_Spectra:
             raise ValueError("Energy axis has already been calculated. Skipping...")
         
         else:
-            print("-> Setting elastic line energy point and applying calibration...")
+            print("\n-> Setting elastic line energy point and applying calibration...")
             if elastic_line_point is None and not auto_elastic_determination:
                 raise ValueError("elastic_line_point is not defined and autodetermination is off. Please set it before calling this method.")
             
+            self.calculate_average_spectrum()
+
             if auto_elastic_determination:
                 # Automatically determine the elastic line point
                 if self.pixel_row_start is None or self.pixel_row_stop is None:
                     raise ValueError("pixel_row_start and pixel_row_stop must be defined for automatic determination.")
+                
                 # Find the maximum point in the specified interval
-                self.calculate_average_spectrum()
+                # self.calculate_average_spectrum()
                 avg_spectrum = self.avg_spectrum_xr_dataset['avg_spectrum'].sel(variable='y').values.copy()
                 x_data = self.avg_spectrum_xr_dataset['avg_spectrum'].sel(variable='x').values.copy()
                 max_index = np.argmax(avg_spectrum[self.pixel_row_start:self.pixel_row_stop]) + self.pixel_row_start
@@ -354,7 +468,6 @@ class Generated_1D_RIXS_Spectra:
                 elastic_line_point = np.sum(x_data[indices] * weights) / np.sum(weights)
                 del avg_spectrum
 
-
             for spec_name in self.spectra_xarray.data_vars:
                 self.spectra_xarray[spec_name].loc[dict(variable='x')] -= elastic_line_point
                 self.spectra_xarray[spec_name].loc[dict(variable='x')] *= calibration
@@ -362,12 +475,20 @@ class Generated_1D_RIXS_Spectra:
                 self.spectra_xarray[spec_name].attrs['calibration'] = calibration
                 self.spectra_xarray[spec_name].attrs['x_name'] = 'Energy Loss (eV)'
             
-            self.energy_axis_calculated = True
             self.calculate_average_spectrum()
+            self.energy_axis_calculated = True
 
-            print(f"Elastic line energy point set to {elastic_line_point}, calibration factor {calibration} eV/pixel.")
+            print(f"\tElastic line energy point set to {elastic_line_point}, calibration factor {calibration*1000:.4f} meV/pixel.")
 
-
+            if plot:
+                if not hasattr(self, 'plot_alignment'):
+                    raise ValueError("Alignment plot not found. Please run align_spectra with plot=True before calling this method with plot=True.")
+                ax = self.plot_alignment[1]
+                ax.axvline(x=elastic_line_point, color='k', linestyle='--', linewidth=1)
+                try:
+                    ax.figure.canvas.draw_idle()
+                except Exception:
+                    pass
 
 
 class RIXS_Spectra:
@@ -430,12 +551,12 @@ class RIXS_Spectra:
         # Load each file and concatenate them into a single xarray.Dataset
         self.ds = xr.Dataset()
         for ii, filepath in enumerate(filelist):
-            ds_now = xr.open_dataset(filepath, engine="h5netcdf")
-            if len(ds_now.data_vars) > 1:
-                print(f"Warning: More than one xrArray found in {filepath}.")
-            for var in ds_now.data_vars:
-                self.ds[str(ii)] = ds_now[var].copy(deep=True)
-        
+            with xr.open_dataset(filepath, engine="h5netcdf") as ds_now:
+                if len(ds_now.data_vars) > 1:
+                    print(f"Warning: More than one xrArray found in {filepath}.")
+                for var in ds_now.data_vars:
+                    self.ds[str(ii)] = ds_now[var].copy(deep=True)
+
         if order_by_parameter is not None:
             self._order_by_parameter(order_by_parameter)
             print(f"Ordered dataset by parameter: {order_by_parameter}")
@@ -547,12 +668,22 @@ class RIXS_Spectra:
 
         # Implement fitting alignment logic here
         # For each xArray in self.ds, extract x_values and y_values
+
+        if plot:
+            #calculate number of subpanels needed
+            num_scans = len(self.ds.data_vars)
+            num_cols = 3
+            num_rows = (num_scans // num_cols) + (num_scans % num_cols > 0)
+            plt.figure(figsize=(num_cols*4, num_rows*4))
+
         for scan in self.ds.data_vars:
             x_values = self.ds[scan].sel(variable='x').values
             y_values = self.ds[scan].sel(variable='y').values
             norm_values = self.ds[scan].sel(variable='norm').values
-            x_values, y_values, norm_values, direction_changed = self._set_direction_energy_loss(x_values, y_values,
+            error_values = self.ds[scan].sel(variable='error').values if 'error' in self.ds[scan].coords['variable'] else None
+            x_values, y_values, norm_values, error_values, direction_changed = self._set_direction_energy_loss(x_values, y_values,
                                                                               norm_values=norm_values,
+                                                                               error_values=error_values,
                                                                                positive_energy_loss=True)
 
             # Find indices within the normalization range
@@ -584,12 +715,13 @@ class RIXS_Spectra:
             shift = popt[1]  # center position from fit
             x_values_shifted = x_values - shift
             # Update the x_values in the dataset
-            self.ds[scan].loc[dict(variable='x')] = x_values_shifted if not direction_changed else -x_values_shifted[::-1]
-            self.ds[scan].loc[dict(variable='y')] = y_values if not direction_changed else y_values[::-1]
-            self.ds[scan].loc[dict(variable='norm')] = norm_values if not direction_changed else norm_values[::-1]
+            self.ds[scan].loc[dict(variable='x')] = x_values_shifted 
+            self.ds[scan].loc[dict(variable='y')] = y_values 
+            self.ds[scan].loc[dict(variable='norm')] = norm_values 
+            self.ds[scan].loc[dict(variable='error')] = error_values
 
             if plot:
-                plt.figure(figsize=(4, 4))
+                plt.subplot(num_rows, num_cols, list(self.ds.data_vars).index(scan)+1)
                 plt.plot(x_values, normed_y, label='Original Data')
                 plt.plot(x_fit, y_fit, 'o', label='Data for Fit')
                 plt.plot(x_values, initialfit, label='Fitted Curve', color='red')
@@ -598,7 +730,9 @@ class RIXS_Spectra:
                 plt.xlabel('Energy Loss (eV)')
                 plt.ylabel('Intensity (arb. units)')
                 plt.legend()
-                plt.show()
+
+        plt.tight_layout()
+        plt.show()
 
     def set_direction_energy_loss_dataset(self, positive_energy_loss=True):
         """
@@ -626,7 +760,7 @@ class RIXS_Spectra:
         
 
     @staticmethod
-    def _set_direction_energy_loss(x_values, y_values, norm_values = None, positive_energy_loss=True):
+    def _set_direction_energy_loss(x_values, y_values, norm_values = None, error_values=None, positive_energy_loss=True):
         # Calculate the sum of y_values for x_values < 0 and x_values > 0
         sum_left = np.sum(y_values[x_values < 0])
         sum_right = np.sum(y_values[x_values > 0])
@@ -638,6 +772,7 @@ class RIXS_Spectra:
             x_values = x_values[idx]
             y_values = y_values[idx]
             norm_values = norm_values[idx] if norm_values is not None else None
+            error_values = error_values[idx] if error_values is not None else None
             direction_changed = True
         elif sum_left < sum_right and not positive_energy_loss:
             #more intensity at positive energy losses
@@ -647,14 +782,20 @@ class RIXS_Spectra:
             x_values = x_values[idx]
             y_values = y_values[idx]
             norm_values = norm_values[idx] if norm_values is not None else None
+            error_values = error_values[idx] if error_values is not None else None
             direction_changed = True
         else:
             #no need to change direction
             direction_changed = False
 
-        return x_values, y_values, norm_values, direction_changed
-    
-    def save_to_hdf5(self, filename):
+        return x_values, y_values, norm_values, error_values, direction_changed
+
+    def save_to_hdf5(self, filename, 
+                     variable_names = [],
+                     additional_metadata={},
+                     normalize_spectra=True,
+                     divide_normalization_by_value=1,
+                     metadata_to_save = None):
         """
         Save the xarray.Dataset to an HDF5 file with motor values as attributes.
 
@@ -671,13 +812,88 @@ class RIXS_Spectra:
         #     motor_values = self.ds[scan].motor_values.values
         #     self.ds[scan].attrs['motor_values'] = motor_values.tolist()
         
-        self.ds.to_netcdf(filename, engine='h5netcdf')
-        print(f"Dataset saved to {filename}")
+        # NOTE joppli 2026-02-21: OLD VERSION
+        # self.ds.to_netcdf(filename, engine='h5netcdf')
+        # print(f"Dataset saved to {filename}")
 
-    def save_to_csv_for_originlab(self, filename, motor_names, motor_name_mapping,
-                                  metadata_in_origin=['Q', 'theta','2theta','phi','energy','polarization',
-                                                      'mirror','sample','B [T]', 'T [K]',],
-                                    normalize_spectra=False,
+        # NOTE joppli 2026-02-21: NEW VERSION BASED ON RAW_XAS_DATA.PY FUNCTIONALITY
+        # Normalize metadata_to_save to a set of keys
+
+        print(f"\n-> Saving dataset to .csv format.\n\tData will {'be normalized' if normalize_spectra else 'not be normalized'}. Normalization value will be divided by {divide_normalization_by_value}.")
+
+        if metadata_to_save is None:
+            # keep all metadata: collect all attribute keys from dataset and each DataArray
+            keep_keys = set()
+            for var in self.ds.data_vars:
+                keep_keys.update(self.ds[var].attrs.keys())
+                keep_keys.update(getattr(self.ds, "attrs", {}).keys())
+        elif isinstance(metadata_to_save, (list, tuple, set)):
+            keep_keys = set(metadata_to_save)
+        else:
+            keep_keys = {str(metadata_to_save)}
+
+        new_ds = xr.Dataset()
+
+        for var_name in self.ds.data_vars:
+            da = self.ds[var_name]
+            if normalize_spectra:
+                y_values = da.sel(variable='y').values
+                error_values = da.sel(variable='error').values if 'error' in da.coords['variable'] else None
+                norm_values = da.sel(variable='norm').values
+                normalized_y = y_values / norm_values * divide_normalization_by_value
+                normalized_error = error_values / norm_values * divide_normalization_by_value if error_values is not None else None
+                da = da.copy(deep=True)
+                da.loc[dict(variable='y')] = normalized_y
+                if error_values is not None:
+                    da.loc[dict(variable='error')] = normalized_error
+            # deep copy the DataArray data and coords
+            # Copy only selected variables if variable_names provided, otherwise copy whole DataArray
+            if variable_names:
+                # Normalize variable_names to list
+                if not isinstance(variable_names, (list, tuple)):
+                    vars_requested = [str(variable_names)]
+                else:
+                    vars_requested = [str(v) for v in variable_names]
+
+                available_vars = [str(v) for v in da.coords['variable'].values]
+                vars_to_copy = [v for v in vars_requested if v in available_vars]
+
+                if len(vars_to_copy) == 0:
+                    # If none of the requested variables exist, fall back to copying everything
+                    print(f"\tWarning: none of requested variable_names {vars_requested} found in DataArray; copying all variables.")
+                    new_da = da.copy(deep=True)
+                else:
+                    # Preserve the order given in vars_to_copy using positional indices,
+                    # which is safe regardless of whether 'variable' is an indexed coord.
+                    indices = [list(available_vars).index(v) for v in vars_to_copy]
+                    new_da = da.isel(variable=indices).copy(deep=True)
+            else:
+                new_da = da.copy(deep=True)
+
+            
+            # filter attributes to only those requested
+            new_da.attrs = {k: v for k, v in new_da.attrs.items() if k in keep_keys}
+            # divide 'mirror' attribute by divide_normalization_by_value
+            if 'mirror' in new_da.attrs:
+                new_da.attrs['mirror'] = new_da.attrs['mirror'] / divide_normalization_by_value
+            new_ds[var_name] = new_da
+
+        # also filter dataset-level attributes if present
+        new_ds.attrs = {k: v for k, v in getattr(self.ds, "attrs", {}).items() if k in keep_keys}
+        for data_var in self.ds.data_vars:
+            da = new_ds[data_var]
+            da.attrs['normalization_divide_value'] = divide_normalization_by_value
+            for k, v in additional_metadata.items():
+                da.attrs[k] = v
+
+        # new_ds.attrs['units'] = units_names
+        new_ds.to_netcdf(filename, engine='h5netcdf')
+        print(f"\tDataset saved to {filename}")
+
+
+    def save_to_csv(self, filename, motors_dict=None,
+                                    normalize_spectra=True,
+                                    save_errorbars=False,
                                     divide_normalization_by_value=1,
                                     positive_energy_loss=True,):
         """
@@ -690,12 +906,8 @@ class RIXS_Spectra:
             The dataset to save.
         filename : str
             The name of the CSV file to save the dataset to.
-        motor_names : list of str
-            List of motor names to include in the header.
-        motor_name_mapping : dict
-            Dictionary mapping motor names in the dataset to motor names expected by OriginLab.
-        metadata_in_origin : list of str
-            List of metadata attributes to include in the OriginLab file.
+        motors_dict : dict
+            Dictionary mapping motor names in the dataset to motor names printed in the csv file.
         normalize_spectra : bool
             If True, normalize the spectra by the normalization dataset.
         divide_normalization_by_value : float
@@ -704,50 +916,40 @@ class RIXS_Spectra:
             If True, set the direction of energy loss to positive. If False, set it to negative.
         """
 
+        print(f"\n-> Saving dataset to .csv format.\n\tData will {'be normalized' if normalize_spectra else 'not be normalized'}. Normalization value will be divided by {divide_normalization_by_value}.")
+        has_error = all(
+            'error' in self.ds[scan].coords['variable'].values
+            for scan in self.ds.data_vars
+        )
+        if not has_error and save_errorbars:
+            print("\tWarning: Not all scans have 'error' variable. Error bars will not be saved.")
+            save_errorbars = False
+
         # Ensure the filename ends with ".csv"
         if not filename.lower().endswith('.csv'):
             base, ext = os.path.splitext(os.path.basename(filename))
             if ext.lower() != '.csv':
-                print(f"Warning: Changing file extension to .csv for {filename}")
+                print(f"\tWarning: Changing file extension to .csv for {filename}")
                 filename = os.path.join(os.path.dirname(filename), base + '.csv')
             filename += '.csv'
 
         first_scan = list(self.ds.data_vars)[0]
-        print(f"Saving dataset- Spectra will be normalized by {self.ds[first_scan].attrs['norm_name']}, divided by {divide_normalization_by_value}.\n")
+
         with open(filename, 'w', encoding='utf-8') as file:
 
             # Write the header with motor values
             # Collect motor values for all scans
-            motor_values_all_scans = {motor: [] for motor in motor_names}
+            motor_values_all_scans = {motor: [] for motor in motors_dict.values()}
             for scan in self.ds.data_vars:
-                for motor in motor_names:
+                for motor in motors_dict.values():
                     if motor in self.ds[scan].attrs:
                         motor_values_all_scans[motor].append(self.ds[scan].attrs[motor])
                     else:
                         motor_values_all_scans[motor].append("")
 
-            #### old version
-            # header = ''
-            # # Write motor values in the header
-            # for metadata in metadata_in_origin:
-            #     header_parts = [metadata]
-            #     if metadata == 'mirror':
-            #         header_parts += [f"{np.mean(self.ds[scan].sel(variable='norm').values):.2f}" for scan in self.ds.data_vars]
-            #     else:                
-            #         if metadata in motor_name_mapping:
-            #             if motor_name_mapping[metadata] is not None:
-            #                 header_parts += [
-            #                     f"{value:.2f}" if isinstance(value, (int, float)) else str(value) 
-            #                     for value in motor_values_all_scans[motor_name_mapping[metadata]]
-            #                 ]
-            #         else:
-            #             header_parts += [" "] * len(motor_values_all_scans[motor_names[0]])
-            #     header += ','.join(header_parts * 2)  # Repeat each motor value twice
-            #     header += '\n'
-
             header = ''
             # Write motor values in the header
-            for metadata in metadata_in_origin:
+            for metadata in motors_dict.keys():
                 header_parts = [metadata]
                 header_parts_1 = [' ' for _ in range(len(self.ds.data_vars))]
                 header_parts_2 = []
@@ -757,11 +959,10 @@ class RIXS_Spectra:
                         else:
                             header_parts_2 += [f"{np.mean(self.ds[scan].sel(variable='norm').values):.2f}" for i, scan in enumerate(self.ds.data_vars)]
                 else:                
-                    if metadata in motor_name_mapping:
-                        if motor_name_mapping[metadata] is not None:
-                            header_parts_2 += [(f"{value:.2f}" if isinstance(value, (int, float)) else str(value))
-                                for i, value in enumerate(motor_values_all_scans[motor_name_mapping[metadata]])
-                            ]
+                    if motors_dict[metadata] is not None:
+                        header_parts_2 += [(f"{value:.2f}" if isinstance(value, (int, float)) else str(value))
+                            for i, value in enumerate(motor_values_all_scans[motors_dict[metadata]])
+                        ]
                     else:
                         header_parts_2 += [" "] * (len(self.ds.data_vars))
 
@@ -775,30 +976,44 @@ class RIXS_Spectra:
                 header += '\n'
 
             # Write a line of "Energy Loss" and {scan} alternating
-            header += ' ,'+','.join([f"Energy Loss,{scan}" for scan in self.ds.data_vars])
-            header += '\n'
-            units = ' ,'+','.join(['(eV),(arb. units)'] * len(self.ds.data_vars))
+            if save_errorbars:
+                header += ' ,'+','.join([f"Energy Loss,{self.ds[scan].attrs['run']},Error" for scan in self.ds.data_vars])
+                header += '\n'
+                units = ' ,'+','.join(['(eV),(arb. units),(arb.units)'] * len(self.ds.data_vars))
+            else:
+                header += ' ,'+','.join([f"Energy Loss,{self.ds[scan].attrs['run']}" for scan in self.ds.data_vars])
+                header += '\n'
+                units = ' ,'+','.join(['(eV),(arb. units)'] * len(self.ds.data_vars))
             units += '\n'
             header += units
             file.write(f"{header}\n")
 
-            # Create a DataFrame to store all scans
-            data_frames = []
             # Stack all x and y values as adjacent columns
             all_data = []
             for scan in self.ds.data_vars:
                 x_values = self.ds[scan].sel(variable='x').values
                 y_values = self.ds[scan].sel(variable='y').values
                 norm_values = self.ds[scan].sel(variable='norm').values
+                
+                error_values = self.ds[scan].sel(variable='error').values if save_errorbars else None
+
                 if normalize_spectra:
-                    # Normalize the y-values by the norm values
+                    # Normalize the y-values (and the errors) by the norm values
                     y_values = y_values / norm_values * divide_normalization_by_value
+                    if save_errorbars:
+                        error_values = error_values / norm_values * divide_normalization_by_value 
 
                 # Calculate the sum of y_values for x_values < 0 and x_values > 0
-                x_values, y_values, norm_values,_ = self._set_direction_energy_loss(x_values, y_values,
+                x_values, y_values, norm_values, error_values, _ = self._set_direction_energy_loss(x_values, y_values,
                                                                                   norm_values=norm_values,
+                                                                                  error_values=error_values,
                                                                                   positive_energy_loss=positive_energy_loss)
-                all_data.append(np.column_stack((x_values, y_values)))
+                
+                if save_errorbars:
+                    # Calculate error bars as sqrt(y_values) for Poisson statistics
+                    all_data.append(np.column_stack((x_values, y_values, error_values)))
+                else:
+                    all_data.append(np.column_stack((x_values, y_values)))
 
             # Concatenate all data along the second axis
             concatenated_data = np.concatenate(all_data, axis=1)
@@ -807,7 +1022,8 @@ class RIXS_Spectra:
             for row in concatenated_data:
                 file.write(' ,'+','.join(map(str, row)) + '\n')
 
-        print(f"Dataset saved to {filename}")
+        print(f"\tDataset saved to {filename}")
+
 
 
     def save_to_txt(self, filename, save_avg_spectrum=False):
@@ -926,20 +1142,3 @@ class RIXS_Spectra:
         return x_arr, par_arr, intensity
         
 
-
-    @staticmethod
-    def _determine_polarization(hu70ap, hu70cp):
-        
-        # Determine polarization based on motor positions
-        if hu70cp > 30 and hu70ap > 30:
-            polarization = 'LV'
-        elif -2 < hu70cp < 2 and -2 < hu70ap < 2:
-            polarization = 'LH'
-        elif 2 <= hu70cp <= 30 and 2 <= hu70ap <= 30:
-            polarization = 'C+'
-        elif -30 <= hu70cp <= -2 and -30 <= hu70ap <= -2:
-            polarization = 'C-'
-        else:
-            polarization = 'Unknown'
-        
-        return polarization

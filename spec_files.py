@@ -2,6 +2,7 @@ import os
 import re
 import numpy as np
 import xarray as xr
+from static_functions import _determine_polarization
 
 
 class SpecFile:
@@ -44,9 +45,60 @@ class SpecFile:
         motval_all_scans = []
         motname_all_scans = []
         motname_all = []
+        cparams_all_scans = []
         date = None
+
+        def _parse_c_params(scan_text):
+            matches = re.findall(r"#C[ \t]?(.*?)(?=#C|\n#|\Z)", scan_text)
+
+            params = {}
+            section = None
+            for raw in matches:
+                line = raw.strip()
+                if not line:
+                    continue
+
+                start_m = re.match(r"--\s*(.+?)\s+start\s*$", line, re.IGNORECASE)
+                end_m = re.match(r"--\s*(.+?)\s+end\s*$", line, re.IGNORECASE)
+                if start_m:
+                    section = start_m.group(1).strip().lower().replace(' ', '_')
+                    continue
+                if end_m:
+                    section = None
+                    continue
+
+                if line.startswith('/'):
+                    key, value = 'raw_file', line
+                else:
+                    parts = re.split(r'\s{2,}', line)
+                    if len(parts) >= 2:
+                        key, value = parts[0].strip(), parts[-1].strip()
+                    else:
+                        key, value = line, None
+
+                    if value == 'True':
+                        value = True
+                    elif value == 'False':
+                        value = False
+                    elif value is not None:
+                        try:
+                            value = float(value)
+                        except ValueError:
+                            pass
+
+                # NEW: no section prefix - but guard against silent collisions
+                if key in params:
+                    raise ValueError(
+                        f"Duplicate #C parameter name '{key}' found while parsing scan header "
+                        f"(section: {section!r}). Remove the prefix-based flattening or rename "
+                        f"one of the colliding keys to resolve this."
+                    )
+                params[key] = value
+
+            return params
+
         
-        if scans_selected == ['all']:
+        if scans_selected == 'all':
 
             if scans_from_same_run:
                 scan_pattern = r"#S (\d+)  Scan \d+:(\d+)"
@@ -107,6 +159,9 @@ class SpecFile:
                 motval_all.extend(motvals)
             motval_all_scans.append(motval_all)
             
+            # NEW: extract #C metadata for this scan (flat dict, no section prefixes)
+            cparams_all_scans.append(_parse_c_params(scan_content))
+
             # Extract numerical data
             data_lines = [line for line in scan_content.split("\n") if not line.startswith("#") and not line.startswith(" ") and line.strip()]
             data = np.loadtxt(data_lines) if data_lines else np.array([])
@@ -130,13 +185,14 @@ class SpecFile:
                     }
                 )
             ds[f'scan_{scan}'].attrs.update({name: value for name, value in zip(motname_all_scans[i], motval_all_scans[i])})
+            ds[f'scan_{scan}'].attrs.update(cparams_all_scans[i])  # NEW: merged flat, same level as motors
             ds[f'scan_{scan}'].attrs['scan'] = scan
         
         
         ds.attrs['date'] = date
         return ds
 
-    def extract_data(self,scans, x_name, y_name, norm_name, motor_names=None,
+    def extract_data(self,scans, x_name, y_name, norm_name, motors_dict=None,
                      scans_from_same_run=False):
         """
         Extract and normalize data based on specified x, y, and normalization datasets,
@@ -150,14 +206,15 @@ class SpecFile:
             Name of the dataset to be used as y-axis.
         norm_name : str
             Name of the dataset to be used for normalization.
-        motor_names : list of str
-            List of motor names to include in the output.
+        motors : dict
+            Dictionary mapping motor names to their corresponding variable names.
 
         Returns
         -------
         xarray.Dataset
             Dataset containing the normalized data and specified motor values.
         """
+        print(f"\n-> Extracting and normalizing data from scans: {scans}.\n\tX-axis: {x_name}, Y-axis: {y_name}, Normalization: {norm_name}.")
         ds = self._read_spec_file(scans_selected=scans, scans_from_same_run=scans_from_same_run)
         self.normalized_data = xr.Dataset()
         
@@ -166,9 +223,6 @@ class SpecFile:
                 x_data = np.copy(ds[scan].sel(datasets=x_name).values)
                 y_data = np.copy(ds[scan].sel(datasets=y_name).values)
                 norm_data = np.copy(ds[scan].sel(datasets=norm_name).values)
-
-                if motor_names:  
-                    motor_values = [ds[scan].attrs[motor] for motor in motor_names if motor in ds[scan].attrs]
                 
                 # Concatenate x_data, y_data, and norm_data along a new dimension
                 data = np.stack([x_data, y_data, norm_data], axis=1)
@@ -185,18 +239,22 @@ class SpecFile:
                 self.normalized_data[scan].attrs['x_name'] = x_name
                 self.normalized_data[scan].attrs['y_name'] = y_name
                 self.normalized_data[scan].attrs['norm_name'] = norm_name
-                
-                if motor_names:
-                    for motor, value in zip(motor_names, motor_values):
-                        self.normalized_data[scan].attrs[motor] = value
-                    if 'hu70cp' in motor_names and 'hu70ap' in motor_names:
+
+                if motors_dict:
+                    for motor in motors_dict.keys():
+                        if motors_dict[motor] in ds[scan].attrs:
+                            self.normalized_data[scan].attrs[motor] = ds[scan].attrs[motors_dict[motor]]
+                        else:
+                            self.normalized_data[scan].attrs[motor] = np.nan
+                            print(f"\tWarning: Motor '{motors_dict[motor]}' not found in scan {scan}. Setting its value to NaN.")
+                    if 'hu70cp' in ds.attrs and 'hu70ap' in ds.attrs:
                         self.normalized_data[scan].attrs['polarization'] = self._determine_polarization(
-                            self.normalized_data[scan].attrs['hu70ap'], 
-                            self.normalized_data[scan].attrs['hu70cp']
+                            ds[scan].attrs['hu70ap'],
+                            ds[scan].attrs['hu70cp']
                         )
 
                 self.normalized_data[scan].attrs['date'] = ds.attrs['date']
-                self.normalized_data[scan].attrs['run'] = self.run
+                self.normalized_data[scan].attrs['run'] = str(self.run)
                 self.normalized_data[scan].attrs['scan'] = ds[scan].attrs['scan']
                 self.normalized_data[scan].attrs['filename'] = self.filename
 
@@ -354,19 +412,8 @@ class SpecFile:
 
         print(f"Dataset saved to {filename}")
     
-    @staticmethod
-    def _determine_polarization(hu70ap, hu70cp):
-        
-        # Determine polarization based on motor positions
-        if hu70cp > 30 and hu70ap > 30:
-            polarization = 'LV'
-        elif -2 < hu70cp < 2 and -2 < hu70ap < 2:
-            polarization = 'LH'
-        elif 2 <= hu70cp <= 30 and 2 <= hu70ap <= 30:
-            polarization = 'C+'
-        elif -30 <= hu70cp <= -2 and -30 <= hu70ap <= -2:
-            polarization = 'C-'
-        else:
-            polarization = 'Unknown'
-        
-        return polarization
+
+
+
+
+

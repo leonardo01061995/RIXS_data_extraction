@@ -20,6 +20,7 @@ import pandas as pd
 from IPython.display import display
 from spec_files import SpecFile
 from one_d_rixs_spectra import Generated_1D_RIXS_Spectra
+from static_functions import _determine_polarization
 
 
 class ESRF_XAS_Spectrum:
@@ -83,26 +84,15 @@ class ESRF_XAS_Spectrum:
             print(f"An unexpected error occurred: {e}")
             return None
         
-        motor_positions['polarization'] = self._determine_polarization(motor_positions)
+        motor_positions['polarization'] = _determine_polarization(motor_positions['hu70ap'], motor_positions['hu70cp'])
 
         return motor_positions
 
-    @staticmethod
-    def _determine_polarization(motor_positions):
-        
-        # Determine polarization based on motor positions
-        if motor_positions['hu70cp'] > 30 and motor_positions['hu70ap'] > 30:
-            polarization = 'LV'
-        elif -2 < motor_positions['hu70cp'] < 2 and -2 < motor_positions['hu70ap'] < 2:
-            polarization = 'LH'
-        elif 2 <= motor_positions['hu70cp'] <= 30 and 2 <= motor_positions['hu70ap'] <= 30:
-            polarization = 'C+'
-        elif -30 <= motor_positions['hu70cp'] <= -2 and -30 <= motor_positions['hu70ap'] <= -2:
-            polarization = 'C-'
-        else:
-            polarization = 'Unknown'
-        
-        return polarization
+
+    
+
+
+
         
     def _extract_xas(self, filepath, x):
         """
@@ -1031,58 +1021,70 @@ class ESRF_run_spectrum:
         # Check for duplicates in runs
         if len(self.runs) != len(set(self.runs)):
             raise ValueError("Duplicate run numbers found in the provided runs.")
-        if not isinstance(scans, list):
-            self.scans = [scans]
-        else:
-            self.scans = scans
-        self.energy_axis_calculated = False
+        
+        if isinstance(scans, str):
+            self.scans = ['all']*len(self.runs)
+
+        if len(self.runs) != len(self.scans):
+            raise ValueError("The number of runs must match the number of scans provided.")
+        
     
 
 
     def _search_runs(self, runs):
-            """
-            Search for filenames corresponding to the specifid runs.
-            Returns
-            -------
-            list
-                List of valid image numbers
-            """
-            # Initialize lists to store results
-            file_names = []
+        """
+        Search for filenames corresponding to the specifid runs.
+        Returns
+        -------
+        list
+            List of valid image numbers
+        """
+        # Initialize lists to store results
+        file_names = []
 
-            # Ensure runs is a list
-            if not isinstance(runs, list):
-                runs = [runs]
+        # Ensure runs is a list
+        if not isinstance(runs, list):
+            runs = [runs]
 
-            # Sort the runs
-            runs = sorted(runs)
+        # Sort the runs
+        runs = sorted(runs)
 
-            # Format run numbers to 4 digits
-            formatted_runs = [f"{int(run):04d}" for run in runs]
+        # Format run numbers to 4 digits
+        formatted_runs = [f"{int(run):04d}" for run in runs]
 
-            # Get all .spec files in directory
-            files = sorted(
-                (entry for entry in os.scandir(self.folder) if entry.name.lower().endswith('.spec')),
-                key=lambda f: f.name  # Sort by file name (assuming natural order by numbers)
-            )
+        # Get all .spec files in directory
+        files = sorted(
+            (entry for entry in os.scandir(self.folder) if entry.name.lower().endswith('.spec')),
+            key=lambda f: f.name  # Sort by file name (assuming natural order by numbers)
+        )
 
-            for file in files:
-                file_path = os.path.join(self.folder, file)
-                for run in formatted_runs:
-                    if run in file.name:
-                        file_names.append(file_path)
+        for file in files:
+            file_path = os.path.join(self.folder, file)
+            for run in formatted_runs:
+                if run in file.name:
+                    file_names.append(file_path)
 
-            if not file_names:
-                print(f"Warning: No valid .spec files found for runs {runs} \n\n")
-            else:
-                print(f"Found {len(file_names)} files: runs {runs}.")
+        if not file_names:
+            print(f"Warning: No valid .spec files found for runs {runs} \n\n")
+        else:
+            print(f"Found {len(file_names)} files: runs {runs}.")
 
-            return file_names
+        return file_names
     
 
     def extract_1d_runs(self,
-                        x_name, y_name, norm_name, motor_names,
-                        plot=False,
+                        x_name, y_name, norm_name, 
+                        motor_names = {
+                                "th": "th",
+                                "chi": "chi",
+                                "phi": "phi",
+                                "tth": "rtth",
+                                "energy": "energy",
+                                "x": "xsam",
+                                "y": "ysam",
+                                "z": "zsam",
+                                "T": "tstage",
+                            },
                         scans_from_same_run=False):
         """
         Extract 1D runs from .spec files in the specified folder.
@@ -1106,11 +1108,11 @@ class ESRF_run_spectrum:
             List of SpecFile objects for each found .spec file
         """
         # Search for .spec files corresponding to the provided runs
-        spec_files = self._search_runs(self.runs)
+        self.spec_files = self._search_runs(self.runs)
 
         # Initialize SpecFile objects for each found .spec file
         spectra_xarray = xr.Dataset()
-        for i, (file, run) in enumerate(zip(spec_files, self.runs)):
+        for i, (file, run) in enumerate(zip(self.spec_files, self.runs)):
             specfile = SpecFile(file, run)
             extracted_data = specfile.extract_data(self.scans[i], x_name, y_name, norm_name, motor_names,
                                                    scans_from_same_run=scans_from_same_run)
@@ -1118,13 +1120,12 @@ class ESRF_run_spectrum:
             for scan_name, data_array in extracted_data.items():
                 new_name = f"run_{run}_scan_{scan_name.split('_')[1]}"
                 spectra_xarray[new_name] = data_array
+                norm_values = data_array.sel(variable='norm').values
+                spectra_xarray[new_name].attrs['mirror'] = float(np.mean(norm_values))
 
-        self.spectra_xarray = Generated_1D_RIXS_Spectra(ds=spectra_xarray)
+        spectra_xarray.attrs['log'] = ''
 
-        if plot:
-            self.plot_spectra()
-
-        return self.spectra_xarray
+        return Generated_1D_RIXS_Spectra(ds=spectra_xarray)
 
 
 

@@ -1137,7 +1137,18 @@ class ESRF_run_spectrum:
     
 
     def _extract_1d_runs(self, runs, scans,
-                        x_name, y_name, norm_name, motor_names,
+                        x_name, y_name, norm_name, 
+                        motors={
+                            "th": "th",
+                            "chi": "chi",
+                            "phi": "phi",
+                            "tth": "rtth",
+                            "energy": "energy",
+                            "x": "xsam",
+                            "y": "ysam",
+                            "z": "zsam",
+                            "T": "tstage",
+                        },
                         plot=False,
                         scans_from_same_run=False):
         """
@@ -1153,8 +1164,8 @@ class ESRF_run_spectrum:
             Name of the y-axis variable.
         norm_name : str
             Name of the normalization variable.
-        motor_names : list
-            List of motor names to be included in the extraction.
+        motors : dict
+            Dictionary mapping motor names to their corresponding variable names.
         xr.Dataset
             An xarray Dataset containing the extracted data for each run and scan.
 
@@ -1173,7 +1184,7 @@ class ESRF_run_spectrum:
         self.spectra_xarray = xr.Dataset()
         for i, (file, run) in enumerate(zip(spec_files, runs)):
             specfile = SpecFile(file, run)
-            extracted_data = specfile.extract_data(scans[i], x_name, y_name, norm_name, motor_names,
+            extracted_data = specfile.extract_data(scans[i], x_name, y_name, norm_name, motors,
                                                    scans_from_same_run=scans_from_same_run)
             
             for scan_name, data_array in extracted_data.items():

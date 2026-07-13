@@ -1,7 +1,12 @@
 import os
 import time
 import h5py
+import fabio
+import re
+
 import numpy as np
+import matplotlib.pyplot as plt
+
 # from scipy.signal import fftconvolve
 from scipy.signal import medfilt2d, correlate
 from scipy.ndimage import median_filter
@@ -12,14 +17,13 @@ from scipy.ndimage import uniform_filter1d
 from scipy.optimize import minimize
 # from scipy import optimize
 from sklearn.linear_model import LinearRegression
-import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import correlate
 from cmcrameri import cm
 from abc import ABC, abstractmethod
-import fabio
 from nexusformat.nexus import *
-import re
+from static_functions import _determine_polarization
+
 
 
 class RIXS_Image(ABC):
@@ -761,10 +765,10 @@ class EDF_Image(RIXS_Image):
         # Try to get polarization motor values from either HU88AP/HU88CP or HU70AP/HU70CP
         if "HU88AP" in self.header:
             ap = float(self.header["HU88AP"])
-            polarization = self._determine_polarization(ap, ap)
+            polarization = _determine_polarization(ap, ap)
         elif "HU70AP" in self.header:
             ap = float(self.header["HU70AP"])
-            polarization = self._determine_polarization(ap, ap)
+            polarization = _determine_polarization(ap, ap)
         else:
             print("Warning: Polarization motor values not found. Polarization could not be determined.")
             polarization = "Unknown"
@@ -828,22 +832,6 @@ class EDF_Image(RIXS_Image):
 
         return header_dict
     
-    @staticmethod
-    def _determine_polarization(hu70ap, hu70cp):
-        
-        # Determine polarization based on motor positions
-        if hu70cp > 30 and hu70ap > 30:
-            polarization = 'LV'
-        elif -2 < hu70cp < 2 and -2 < hu70ap < 2:
-            polarization = 'LH'
-        elif 2 <= hu70cp <= 30 and 2 <= hu70ap <= 30:
-            polarization = 'C+'
-        elif -30 <= hu70cp <= -2 and -30 <= hu70ap <= -2:
-            polarization = 'C-'
-        else:
-            polarization = 'Unknown'
-        
-        return polarization
 
 class TPS_Image(RIXS_Image):
     def __init__(self, file_path, file_path_background = None):
