@@ -22,7 +22,7 @@ from scipy.signal import correlate
 from cmcrameri import cm
 from abc import ABC, abstractmethod
 from nexusformat.nexus import *
-from static_functions import _determine_polarization
+from static_functions import _determine_polarization, _parallel_median_filter
 
 
 
@@ -1152,6 +1152,9 @@ class DLS_Image(RIXS_Image):
         self._subtract_dark()
         self._correct_curvature(curve_a=kwargs.get('curve_a', 0), curve_b=kwargs.get('curve_b', 0))
 
+        #flip the direction of image
+        self.imgs_processed = np.array([np.flipud(img) for img in self.imgs_processed])
+
         return self.imgs_processed, self.normalization_factor
 
 
@@ -1590,7 +1593,63 @@ class DLS_Image(RIXS_Image):
         elapsed_time = end_time - start_time
         print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
 
-    def _filter_img(self, img_median_filter_kernel=[5,3,5], spikes_threshold=1.4):
+
+    def _filter_img(self, img_median_filter_kernel=[5, 3, 5], spikes_threshold=1.4, n_jobs=None):
+        """
+        Removes spikes from detector images using a 3D median filter.
+
+        Same behavior as before, but the median filter is parallelized by
+        splitting the 3D stack along the vertical spatial axis (axis 1).
+        Each worker filters a slab plus a halo (overlap) of `kernel` rows on
+        each side so the result is bit-for-bit identical to filtering the whole
+        array at once; the halo is cropped off before reassembly.
+
+        Parameters
+        ----------
+        img_median_filter_kernel : list of int, default=[5,3,5]
+            [frames, vertical_pixels, horizontal_pixels] kernel dimensions.
+            The frames dimension is capped at min(5, number of images).
+        spikes_threshold : float, default=1.4
+            Pixels with (original - median)/count_time > threshold are spikes.
+        n_jobs : int or None, default=None
+            Number of worker processes. None -> os.cpu_count().
+        """
+        start_time = time.perf_counter()
+
+        if self.data_count_time is None:
+            raise Exception("Provide data counting time first.")
+
+        if img_median_filter_kernel[0] + img_median_filter_kernel[1] + img_median_filter_kernel[2] > 1.0:
+            k0 = min(self.raw_data.shape[0], 5)
+            k1 = img_median_filter_kernel[1]
+            k2 = img_median_filter_kernel[2]
+            size = (k0, k1, k2)
+
+            print(f"Removing spikes from images: kernel size {k0}x{k1}x{k2}, "
+                  f"spikes_threshold={spikes_threshold}.")
+            print("Using parallel median_filter of scipy.ndimage (split along axis 1).")
+
+            img_corr_med = _parallel_median_filter(self.raw_data, size, n_jobs=n_jobs)
+
+            spikes = (self.raw_data - img_corr_med) / np.asarray(self.data_count_time).reshape(-1, 1, 1)
+            self.imgs_processed = np.where(spikes > spikes_threshold, img_corr_med, self.raw_data)
+
+            print("Found these spikes per image: ", end="")
+            for spike_2d in spikes:
+                count = np.sum(spike_2d > spikes_threshold)
+                print(f"{count}, ", end="")
+            print("\n", end="")
+        else:
+            print("No spike removal.")
+            self.imgs_processed = self.raw_data.copy()
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
+
+
+
+    def _filter_img_old(self, img_median_filter_kernel=[5,3,5], spikes_threshold=1.4):
         """
         Removes spikes from detector images using a 3D median filter.
 
@@ -1620,7 +1679,7 @@ class DLS_Image(RIXS_Image):
             print("Using median_filter of scipy.ndimage.")
             img_corr_med = median_filter(self.raw_data, size=(min(self.raw_data.shape[0], 5), 
                                                                img_median_filter_kernel[1], img_median_filter_kernel[2])) #applying the median filter
-            spikes = (self.raw_data - img_corr_med) / self.data_count_time[:, None, None] #getting the spikes
+            spikes = (self.raw_data - img_corr_med) / np.asarray(self.data_count_time).reshape(-1, 1, 1) #getting the spikes
             self.imgs_processed = np.where(spikes>spikes_threshold, img_corr_med ,self.raw_data) #filtering the spikes
 
             print("Found these spikes per image: ", end="")
