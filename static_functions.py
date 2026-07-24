@@ -165,9 +165,7 @@ def calculate_shift_new(spectra,
 
 def calculate_shift_mccc(spectra,
                        aligning_range=None,
-                       fit_shifts=False,
-                       smooth_shifts=False,
-                       interp_shifts=True,
+                       shift_postprocess='none',
                        correlation_batch_size=50,
                        poly_order=2):
     """
@@ -317,17 +315,17 @@ def calculate_shift_mccc(spectra,
             continue
         elif len(grp_shifts) == 1:
             shifts[img_start:img_end] = grp_shifts[0]
-        elif fit_shifts:
+        elif shift_postprocess == 'fit':
             deg = min(poly_order, len(grp_shifts) - 1)
             coeffs = np.polyfit(grp_idx_aux, grp_shifts, deg=deg)
             shifts[img_start:img_end] = np.polyval(coeffs, grp_indices)
-        elif smooth_shifts:
+        elif shift_postprocess == 'smooth':
             shifts[img_start:img_end] = np.interp(
                 grp_indices, grp_idx_aux, grp_shifts,
                 left=grp_shifts[0], right=grp_shifts[-1])
             shifts[img_start:img_end] = gaussian_filter1d(
                 shifts[img_start:img_end], sigma=correlation_batch_size)
-        elif interp_shifts:
+        elif shift_postprocess == 'interp':
             shifts[img_start:img_end] = np.interp(
                 grp_indices, grp_idx_aux, grp_shifts,
                 left=grp_shifts[0], right=grp_shifts[-1])
@@ -702,7 +700,7 @@ def _find_aligning_range(avg_spectrum, x_data=None, threshold=0.05, extended_ran
     # Use the peak position
     elastic_line = peak_start[0]
     range_start = max(elastic_line - 15*multiplication_factor, 0)
-    range_stop = min(elastic_line + 50*multiplication_factor, avg_spectrum.size)
+    range_stop = min(elastic_line + 50*multiplication_factor, avg_spectrum.size-1)
 
     print(f"\tUsing range: {range_start}, {range_stop} (x_data: {x_data[range_start]:.2f}, {x_data[range_stop]:.2f})")
     
@@ -752,7 +750,7 @@ def check_variations_parameters(spectra_xarray, attributes_to_exclude, threshold
 
     print("")
     if change_flag_value:
-        print(f"******Warning******: Attributes {parameter_changes_values} differs by more than 0.1 between spectra.")
+        print(f"******Warning******: Attributes {parameter_changes_values} differs by more than {threshold} between spectra.")
         for key in parameter_changes_values:
             print(f"<{key}> values:  ", end="")
             for spec_name in spectra_xarray.data_vars:
