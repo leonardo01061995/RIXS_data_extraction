@@ -27,7 +27,7 @@ def filter_metadata(metadata):
 
     filtered_metadata = {}
     for key, values in metadata.items():
-        if key not in ['th', 'chi', 'phi', 'tth', 'H', 'K', 'L','mirror', 'T', 'B', 'polarization', 'energy', 'run']:
+        if key not in ['th', 'chi', 'phi', 'tth', 'H', 'K', 'L','mirror', 'T', 'B', 'polarization', 'energy', 'run', 'sample']:
             continue  # skip x_name and y_name as they are used for labels
         else:
             key = key + ' [rlu]' if key in ['H','K','L'] else key
