@@ -37,34 +37,139 @@ class Raw_XAS_Data(ABC):
         Dictionary containing motor positions for each run.
     """
     
-    def __init__(self, runs, filepaths=None, folder=None):
+    def __init__(self, facility):
         """Initialize the Raw_XAS_Data object."""
-        # Convert runs to list if needed
-        self.runs = runs if isinstance(runs, list) else [runs]
-        
-        # Check for duplicates in runs
-        if len(self.runs) != len(set(self.runs)):
-            raise ValueError("Duplicate run numbers found in the provided runs.")
-        
-        # Validate that either filepaths or folder is provided (but not both)
-        if filepaths is None and folder is None:
-            raise ValueError("Either 'filepaths' or 'folder' must be provided.")
-        if filepaths is not None and folder is not None:
-            raise ValueError("Cannot provide both 'filepaths' and 'folder'. Please provide only one.")
-        
-        self.folder = folder
-        
-        # Get filepaths
-        if folder is not None:
-            if not os.path.isdir(folder):
-                raise ValueError(f"The specified folder does not exist: {folder}")
-            self.filepaths = self._get_filepaths_from_runs()
-        else:
-            self.filepaths = self._validate_filepaths(filepaths)
-        
+
+        self.facility = facility
         # Initialize data storage
         self.ds = None
     
+    def __add__(self, other):
+        """
+        Combine two Raw_XAS_Data objects into a new one by merging their
+        datasets. Shortcut for :meth:`merge` with no sorting.
+
+        See :meth:`merge` for full documentation.
+        """
+        return self.merge(other, sort_by=None)
+
+    def merge(self, other, sort_by=None):
+        """
+        Combine two Raw_XAS_Data objects into a new one by merging their
+        datasets.
+
+        For each operand the contribution is:
+
+        - the ``'avg'`` DataArray only, if it exists in the object's dataset
+          (including objects that are themselves already the result of a
+          previous merge and therefore contain multiple ``'avg'``-derived
+          DataArrays);
+        - otherwise **all** individual DataArrays present in the dataset.
+
+        The merged DataArrays are stored under progressive integer keys
+        ``'0'``, ``'1'``, … inside a new instance of the **same concrete
+        subclass**.  ``runs`` and ``filepaths`` of the new object reflect the
+        combined run lists.
+
+        Parameters
+        ----------
+        other : Raw_XAS_Data
+            Another Raw_XAS_Data (or subclass) object to package together.
+        sort_by : str or None, optional
+            If provided, the merged DataArrays are sorted by the value of
+            this metadata attribute (taken from each DataArray's ``.attrs``).
+            DataArrays for which the attribute is missing are placed at the
+            end, in their original order.  Default is ``None`` (no sorting).
+
+        Returns
+        -------
+        Raw_XAS_Data
+            A new instance of the same subclass containing the merged dataset.
+
+        Raises
+        ------
+        TypeError
+            If *other* is not a Raw_XAS_Data instance.
+        ValueError
+            If either object has no data loaded.
+        """
+        if not isinstance(other, Raw_XAS_Data):
+            raise TypeError("Can only merge Raw_XAS_Data objects together.")
+        if self.ds is None or other.ds is None:
+            raise ValueError("Both objects must have data loaded before merging.")
+
+        def _collect(xas_obj):
+            """Return an ordered list of DataArrays for the object's contribution."""
+            ds = xas_obj.ds
+            # If an 'avg' key is present, take only that one.
+            # If the object was itself produced by a previous merge the individual
+            # DataArrays already carry the avg content, so we take all of them
+            # (there is no single 'avg' key in that case).
+            if 'avg' in ds.data_vars:
+                return [ds['avg']]
+            return [ds[k] for k in ds.data_vars]
+
+        collected = _collect(self) + _collect(other)
+
+        # Optionally sort by a metadata attribute
+        if sort_by is not None:
+            def _sort_key(da):
+                val = da.attrs.get(sort_by, None)
+                # Put missing values at the end
+                if val is None:
+                    return (1, 0)
+                try:
+                    return (0, float(val))
+                except (TypeError, ValueError):
+                    return (0, str(val))
+            collected.sort(key=_sort_key)
+            print(f"Merged DataArrays sorted by '{sort_by}': "
+                  f"{[da.attrs.get(sort_by, '<missing>') for da in collected]}")
+
+        # Assign progressive integer keys
+        merged_vars = {str(i): da for i, da in enumerate(collected)}
+        new_ds = xr.Dataset(merged_vars)
+
+        new_obj = object.__new__(self.__class__)
+        new_obj.facility  = getattr(self, 'facility', None)
+        new_obj.ds        = new_ds
+
+        return new_obj
+    
+
+
+    def _compare_processing_metadata(self, other):
+        # compare processing_metadata dictionaries and warn on differences
+        pm_self = getattr(self, "processing_metadata", {}) or {}
+        pm_other = getattr(other, "processing_metadata", {}) or {}
+
+        for k in sorted(set(pm_self.keys()) | set(pm_other.keys())):
+            v_self = pm_self.get(k, None)
+            v_other = pm_other.get(k, None)
+
+            # convert to JSON-serializable forms for robust comparison
+            try:
+                s_self = self._to_serializable(v_self)
+            except Exception:
+                s_self = str(v_self)
+            try:
+                s_other = self._to_serializable(v_other)
+            except Exception:
+                s_other = str(v_other)
+
+            # numeric comparison when both are numbers
+            equal = False
+            try:
+                if isinstance(s_self, (int, float, np.floating, np.integer)) and isinstance(s_other, (int, float, np.floating, np.integer)):
+                    equal = np.isclose(float(s_self), float(s_other), rtol=1e-3, atol=1e-10)
+                else:
+                    equal = (s_self == s_other)
+            except Exception:
+                equal = (str(s_self) == str(s_other))
+
+            if not equal:
+                print(f"WARNING: processing_metadata['{k}'] differ between the two XAS objects.")
+
     def _validate_filepaths(self, filepaths):
         """Validate and format the provided filepaths."""
         if isinstance(filepaths, list):
@@ -139,40 +244,94 @@ class Raw_XAS_Data(ABC):
         return motor_positions
     
     def print_summary(self):
-        """Print a summary of the loaded data."""
+        """Print a summary of the loaded data as a formatted metadata table.
+
+        Each row corresponds to one DataArray (data variable) in the dataset.
+        Columns show all metadata attributes found across all DataArrays,
+        excluding internal processing keys (filepath, history, coefficients).
+        """
+        _SEP = '='
+
         print(f"\n{'='*60}")
-        print(f"Raw XAS Data Summary")
+        print(f"  Raw XAS Data Summary")
         print(f"{'='*60}")
-        print(f"Facility: {self.__class__.__name__}")
-        print(f"Number of runs: {len(self.runs)}")
-        print(f"Runs: {self.runs}")
-        if self.folder is not None:
-            print(f"Data folder: {self.folder}")
+        print(f"  Facility : {self.__class__.__name__}")
+        if hasattr(self, 'folder') and self.folder is not None:
+            print(f"  Folder   : {self.folder}")
+
+        if self.ds is None:
+            print("  No data loaded yet. Please call load_data() first.")
+            print(f"{'='*60}\n")
+            return
+
+        data_vars = list(self.ds.data_vars)
+        first_da  = self.ds[data_vars[0]]
+        scan_vars = list(first_da.coords['variable'].values)
+
+        # --- Collect metadata keys (skip internal / bulky attrs) -----------
+        _skip = {'history_actions',
+                'coeffs_pre_edge', 'coeffs_post_edge',
+                'range_pre_edge', 'range_post_edge', 'energy_edge', 'step',
+                'normalization_method'}
         
-        if self.ds is not None:
-            print(f"Loaded data for {len(self.ds.data_vars)} run(s)")
-            
-            if len(self.ds.data_vars) > 0:
-                print(f"\nData structure for each run:")
-                first_var = list(self.ds.data_vars)[0]
-                first_data = self.ds[first_var]
-                print(f"  Shape: {first_data.shape}")
-                print(f"  Variables: {list(first_data.coords['variable'].values)}")
-                
-                # Print motor positions from first run
-                motor_attrs = {k: v for k, v in first_data.attrs.items() 
-                              if k not in ['filepath', 'run']}
-                if motor_attrs:
-                    print(f"\nMotor positions available for all runs")
-                    print(f"Example motor names (run {first_data.attrs.get('run')}):")
-                    for i, motor in enumerate(list(motor_attrs.keys())[:5]):
-                        print(f"  - {motor}")
-                    if len(motor_attrs) > 5:
-                        print(f"  ... and {len(motor_attrs) - 5} more")
-        else:
-            print("No data loaded yet. Please call load_data() first.")
-        
-        print(f"{'='*60}\n")
+        all_keys = []
+        seen = set()
+        for var_name in data_vars:
+            for k in self.ds[var_name].attrs:
+                if k not in seen and k not in _skip:
+                    all_keys.append(k)
+                    seen.add(k)
+
+        if not all_keys:
+            print("\n  (No metadata attributes found.)")
+            print(f"{'='*60}\n")
+            return
+
+        # --- Format helper --------------------------------------------------
+        def _fmt(val):
+            if val is None:
+                return '—'
+            if isinstance(val, (list, tuple)):
+                inner = ', '.join(_fmt(v) for v in val)
+                return f'[{inner}]'
+            if isinstance(val, (float, np.floating)):
+                return f"{float(val):.4g}"
+            if isinstance(val, (np.integer,)):
+                return str(int(val))
+            return str(val)
+
+        # --- Build cell matrix: rows = data_vars, cols = ['#'] + all_keys --
+        col_headers = ['#'] + all_keys
+        cell_rows = []
+        for var_name in data_vars:
+            attrs = self.ds[var_name].attrs
+            row = [var_name] + [_fmt(attrs.get(k)) for k in all_keys]
+            cell_rows.append(row)
+
+        # --- Compute column widths ------------------------------------------
+        col_widths = []
+        for c, hdr in enumerate(col_headers):
+            w = len(hdr)
+            for row in cell_rows:
+                w = max(w, len(row[c]))
+            col_widths.append(w)
+
+        # --- Render table ---------------------------------------------------
+        col_sep = '  │  '
+        def _render_row(cells):
+            return col_sep.join(
+                cells[c].ljust(col_widths[c]) for c in range(len(col_headers))
+            )
+
+        total_width = sum(col_widths) + len(col_sep) * (len(col_headers) - 1)
+        h_rule      = '─' * total_width
+
+        print(f"\n  {_render_row(col_headers)}")
+        print(f"  {h_rule}")
+        for row in cell_rows:
+            print(f"  {_render_row(row)}")
+
+        print(f"\n{'='*60}\n")
 
     def average_xas(self):
         """
@@ -247,6 +406,10 @@ class Raw_XAS_Data(ABC):
                             print(f"Warning: attribute '{key}' differs between runs "
                                   f"(run {run_labels[0]}: {ref_val}, "
                                   f"run {da.attrs.get('run', var_name)}: {cur_val})")
+                            
+        xas_list      = np.array(xas_list)
+        xas_norm_list = np.array(xas_norm_list)
+        i0_list       = np.array(i0_list)
 
         avg_data = np.column_stack([
             energy0,
@@ -329,15 +492,15 @@ class Raw_XAS_Data(ABC):
         indices_before_edge = np.where(energy <= energy_edge)[0]
 
         run_label = attrs.get('run', first_var if run is None else run)
-        plt.figure(figsize=(6, 5))
+        plt.figure(figsize=(8, 3))
         plt.plot(energy, xas_before_post_edge, label="XAS after pre-edge removal", color='k')
         plt.plot(energy[indices_after_edge],
                  np.polyval(coeffs_post_edge, energy[indices_after_edge]) / divisor,
                  label="Post-edge fit", color="#ed6262")
         plt.plot(energy[indices_before_edge],
                  np.polyval(coeffs_post_edge, energy[indices_before_edge]) / divisor,
-                 label="Post-edge fit (extrapolated)", color="#ed6262", linestyle='dashed')
-        plt.plot(energy, xas_norm, label="XAS with post-edge slope removed", color='#B3CDE3')
+                 label="Post-edge fit (extrap.)", color="#ed6262", linestyle='dashed')
+        plt.plot(energy, xas_norm, label="XAS with post-edge\nslope removed", color='#B3CDE3')
 
         # Mark the edge energy on the plot
         idx_edge = int(np.argmin(np.abs(energy - energy_edge)))
@@ -374,11 +537,36 @@ class Raw_XAS_Data(ABC):
                     new_handles.append(h)
                     new_labels.append(l)
             plt.legend(new_handles, new_labels)
+        # plt.ylim(bottom = -1, top = 1.1 * max(np.max(xas_before_post_edge), np.max(xas_norm)))
         plt.xlabel("Energy (eV)")
         plt.ylabel("Intensity (arb. units)")
         plt.title(f"Post-edge manipulation — run {run_label}")
         plt.grid()
-        plt.legend()
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.tight_layout()
+        plt.show()
+
+    def plot_all_spectra(self):
+        """Plot the normalized XAS for all runs in the dataset."""
+
+        if self.ds is None:
+            raise ValueError("No data loaded. Please call load_data() first.")
+
+        plt.figure(figsize=(8, 3))
+        for var_name in self.ds.data_vars:
+            da = self.ds[var_name]
+            energy = da.sel(variable='Energy (eV)').values
+            if 'XAS_norm (arb. units)' not in da.coords['variable'].values:
+                raise ValueError(f"Normalized XAS not found in run {da.attrs.get('run', var_name)}. Please run normalize_xas() first.")
+            
+            xas_norm = da.sel(variable='XAS_norm (arb. units)').values
+            run_label = da.attrs.get('run', var_name)
+            plt.plot(energy, xas_norm, label=f"Run {run_label}")
+        plt.xlabel("Energy (eV)")
+        plt.ylabel("Normalized XAS (arb. units)")
+        plt.title("Normalized XAS for all runs")
+        plt.grid()
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.show()
 
@@ -742,10 +930,12 @@ class Raw_XAS_Data(ABC):
             _write(out_file, total_dict_json)
             return out_file
         
-    def save_hdf5_file(self, folder_out, filename_out, run=None,
+    def save_hdf5_file(self, folder_out, filename_out, 
+                       save_avg=True,
+                       run=None,
                        variable_names = [],
                        additional_metadata={}, save_multiple_files=False,
-                       metadata_to_save = []):
+                       metadata_to_save = None):
         """
         Save the processed XAS data to one or more HDF5 files.
         """
@@ -761,7 +951,10 @@ class Raw_XAS_Data(ABC):
 
         # Normalize metadata_to_save to a set of keys
         if metadata_to_save is None:
-            keep_keys = set()
+            # keep all metadata keys found in the dataset and in any DataArray
+            keep_keys = set(getattr(self.ds, "attrs", {}).keys())
+            for var_name in self.ds.data_vars:
+                keep_keys.update(self.ds[var_name].attrs.keys())
         elif isinstance(metadata_to_save, (list, tuple, set)):
             keep_keys = set(metadata_to_save)
         else:
@@ -769,10 +962,8 @@ class Raw_XAS_Data(ABC):
 
         new_ds = xr.Dataset()
 
-        for var_name in self.ds.data_vars:
-            da = self.ds[var_name]
-            # deep copy the DataArray data and coords
-            # Copy only selected variables if variable_names provided, otherwise copy whole DataArray
+        if save_avg and 'avg' in self.ds.data_vars:
+            da = self.ds['avg']
             if variable_names:
                 # Normalize variable_names to list
                 if not isinstance(variable_names, (list, tuple)):
@@ -784,23 +975,50 @@ class Raw_XAS_Data(ABC):
                 vars_to_copy = [v for v in vars_requested if v in available_vars]
 
                 if len(vars_to_copy) == 0:
-                    # If none of the requested variables exist, fall back to copying everything
-                    print(f"Warning: none of requested variable_names {vars_requested} found in DataArray; copying all variables.")
+                    print(f"Warning: none of requested variable_names {vars_requested} found in 'avg' DataArray; copying all variables.")
                     new_da = da.copy(deep=True)
                 else:
-                    # Preserve the order given in vars_to_copy using positional indices,
-                    # which is safe regardless of whether 'variable' is an indexed coord.
                     indices = [list(available_vars).index(v) for v in vars_to_copy]
                     new_da = da.isel(variable=indices).copy(deep=True)
             else:
                 new_da = da.copy(deep=True)
-            # filter attributes to only those requested
+
             new_da.attrs = {k: v for k, v in new_da.attrs.items() if k in keep_keys}
-            new_ds[var_name] = new_da
+            new_ds['avg'] = new_da
+
+        else:
+            for var_name in self.ds.data_vars:
+                da = self.ds[var_name]
+                # deep copy the DataArray data and coords
+                # Copy only selected variables if variable_names provided, otherwise copy whole DataArray
+                if variable_names:
+                    # Normalize variable_names to list
+                    if not isinstance(variable_names, (list, tuple)):
+                        vars_requested = [str(variable_names)]
+                    else:
+                        vars_requested = [str(v) for v in variable_names]
+
+                    available_vars = [str(v) for v in da.coords['variable'].values]
+                    vars_to_copy = [v for v in vars_requested if v in available_vars]
+
+                    if len(vars_to_copy) == 0:
+                        # If none of the requested variables exist, fall back to copying everything
+                        print(f"Warning: none of requested variable_names {vars_requested} found in DataArray; copying all variables.")
+                        new_da = da.copy(deep=True)
+                    else:
+                        # Preserve the order given in vars_to_copy using positional indices,
+                        # which is safe regardless of whether 'variable' is an indexed coord.
+                        indices = [list(available_vars).index(v) for v in vars_to_copy]
+                        new_da = da.isel(variable=indices).copy(deep=True)
+                else:
+                    new_da = da.copy(deep=True)
+                # filter attributes to only those requested
+                new_da.attrs = {k: v for k, v in new_da.attrs.items() if k in keep_keys}
+                new_ds[var_name] = new_da
 
         # also filter dataset-level attributes if present
         new_ds.attrs = {k: v for k, v in getattr(self.ds, "attrs", {}).items() if k in keep_keys}
-        for data_var in self.ds.data_vars:
+        for data_var in new_ds.data_vars:
             da = new_ds[data_var]
             for k, v in additional_metadata.items():
                 da.attrs[k] = v
@@ -812,7 +1030,8 @@ class Raw_XAS_Data(ABC):
 
 
     def save_csv_file(self, folder_out, filename_out,
-                        variable_names, units_names,
+                        variable_names=None, units_names=None,
+                        metadata_to_save=None,
                       additional_metadata={}):
         """
         Save the processed XAS data to a CSV file.
@@ -821,16 +1040,23 @@ class Raw_XAS_Data(ABC):
         filepath = os.path.join(folder_out, filename_out)
         header = ''
         first_var = list(self.ds.data_vars)[0]
-        tot_metadata = [meta for meta in self.ds[first_var].attrs if meta not in ['filepath', 'run', 
-                                                                                  'history_actions',
-                                                                                  'coeffs_pre_edge', 'coeffs_post_edge',
-                                                                                  'range_pre_edge', 'range_post_edge', 'energy_edge', 'step',
-                                                                                  'normalization_method']]
+
+        if metadata_to_save is None:
+            tot_metadata = [meta for meta in self.ds[first_var].attrs if meta not in ['filepath', 'run', 
+                                                                                    'history_actions',
+                                                                                    'coeffs_pre_edge', 'coeffs_post_edge',
+                                                                                    'range_pre_edge', 'range_post_edge', 'energy_edge', 'step',
+                                                                                    'normalization_method']]
+        else:
         # tot_metadata += list(additional_metadata.keys())
+            if isinstance(metadata_to_save, (list, tuple, set)):
+                tot_metadata = [str(m) for m in metadata_to_save]
+            else:
+                tot_metadata = [str(metadata_to_save)]
 
         for metadata in tot_metadata:
 
-            header_parts = ['#'+metadata]
+            header_parts = [''+metadata]
             header_parts_1 = [' ' for _ in range(len(self.ds.data_vars))]
             header_parts_2 = []
 
@@ -848,7 +1074,7 @@ class Raw_XAS_Data(ABC):
             header += '\n'
 
         for k, v in additional_metadata.items():
-            header_parts = [f"#{k}"]
+            header_parts = [f"{k}"]
             header_parts_1 = [' ' for _ in range(len(self.ds.data_vars))]
             header_parts_2 = []
             header_parts_2 += [(f"{v:.2f}" if isinstance(v, (int, float)) else str(v))
@@ -1429,8 +1655,33 @@ class DLS_XAS_Data(Raw_XAS_Data):
             "DLS filepath retrieval is not yet implemented."
         )
     
-    def load_data(self, xas_dataset='draincurrent_c'):
+    def load_data(self, runs, folder=None, filepaths=None,
+                  xas_dataset='draincurrent_c'):
         """Load XAS data from DLS HDF5 files into an xarray Dataset."""
+
+                # Convert runs to list if needed
+        self.runs = runs if isinstance(runs, list) else [runs]
+        
+        # Check for duplicates in runs
+        if len(self.runs) != len(set(self.runs)):
+            raise ValueError("Duplicate run numbers found in the provided runs.")
+        
+        # Validate that either filepaths or folder is provided (but not both)
+        if filepaths is None and folder is None:
+            raise ValueError("Either 'filepaths' or 'folder' must be provided.")
+        if filepaths is not None and folder is not None:
+            raise ValueError("Cannot provide both 'filepaths' and 'folder'. Please provide only one.")
+        
+        self.folder = folder
+        
+        # Get filepaths
+        if folder is not None:
+            if not os.path.isdir(folder):
+                raise ValueError(f"The specified folder does not exist: {folder}")
+            self.filepaths = self._get_filepaths_from_runs()
+        else:
+            self.filepaths = self._validate_filepaths(filepaths)
+
         print(f"Loading DLS data from {len(self.filepaths)} file(s)...")
 
         if xas_dataset not in ['draincurrent_c', 'fy2_c', 'diff1_c']:
