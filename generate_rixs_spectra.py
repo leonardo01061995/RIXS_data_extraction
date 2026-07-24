@@ -314,7 +314,7 @@ class RIXS_Raw_Images:
         if not extract_curvature and (curve_a == 0 and curve_b == 0):
             print("Careful: Curvature extraction is disabled and the given slope is zero")
 
-        if not find_aligning_range and (pixel_row_start is None or pixel_row_stop is None):
+        if align_images and (not find_aligning_range and (pixel_row_start is None or pixel_row_stop is None)):
             raise ValueError("If find_aligning_range is False, both pixel_row_start and pixel_row_stop must be provided.")
         
         self.ds_1d = xr.Dataset()
@@ -329,7 +329,7 @@ class RIXS_Raw_Images:
         else:
             norm_name = "norm"
              
-        print("Performing generation of RIXS spectra from images and curvature correction.")
+        print("-> Performing generation of RIXS spectra from images and curvature correction.")
         start_time = time.perf_counter()
         raw_imgs = []
         for run_index, filename in enumerate(self.file_names):
@@ -382,7 +382,8 @@ class RIXS_Raw_Images:
                         "x_name": 'Pixel',
                         "y_name": y_name,
                         "norm_name": norm_name,
-                        'run_number': img.run_number,
+                        'run': str(img.run_number),
+                        'filename': filename,
                     }
                 )
                 self.ds_1d[f"{i}"] = da
@@ -458,6 +459,7 @@ class RIXS_Raw_Images:
             if keep_2d_images:
                 self.imgs_processed = processed_images
 
+        self.ds_1d.attrs['log'] = ''
         return Generated_1D_RIXS_Spectra(self.ds_1d)
    
 
@@ -557,9 +559,9 @@ class RIXS_Raw_Images:
             hf.attrs['filename_dir'] = self.folder
             # Save only the first element if self.run_number is a list
             if isinstance(self.run_number, list):
-                hf.attrs['run_number'] = f"{self.folder}_run#_{int(self.run_number[0]):04d}"  # Save formatted run number
+                hf.attrs['run'] = f"{self.folder}_run#_{int(self.run_number[0]):04d}"  # Save formatted run number
             else:
-                hf.attrs['run_number'] = f"{self.folder}_run#_{int(self.run_number):04d}"
+                hf.attrs['run'] = f"{self.folder}_run#_{int(self.run_number):04d}"
 
         print(f"Pre-processed dataset saved as {filename_save} \n\n")
 
