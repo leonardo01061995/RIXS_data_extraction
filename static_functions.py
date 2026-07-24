@@ -4,14 +4,61 @@ import time
 import numpy as np
 import xarray as xr
 from scipy.signal import correlate
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.signal import fftconvolve, correlate, correlation_lags
 from scipy.optimize import curve_fit
 from cmcrameri import cm
 from IPython.display import display
 import pandas as pd
 
+from concurrent.futures import ProcessPoolExecutor
+# median_filter and np are already imported in this module
 
+def _median_filter_chunk(args):
+    """Worker: median-filter a single spatial slab (runs in its own process)."""
+    chunk, size = args
+    return median_filter(chunk, size=size)
+
+def _parallel_median_filter(data, size, n_jobs=None, axis=1):
+    """
+    3D median filter parallelized by splitting `data` along `axis`
+    (default 1, the vertical spatial dimension). Uses a halo so seams
+    are exact. Returns an array identical to median_filter(data, size).
+    """
+    H = data.shape[axis]
+    pad = size[axis]  # generous halo (>= kernel radius on each side)
+
+    if n_jobs is None:
+        n_jobs = os.cpu_count() or 1
+    n_jobs = max(1, min(n_jobs, H))
+
+    # Not worth spawning processes for tiny arrays / single core.
+    if n_jobs == 1:
+        return median_filter(data, size=size)
+
+    bounds = np.linspace(0, H, n_jobs + 1).astype(int)
+    tasks, slices = [], []
+    for i in range(n_jobs):
+        s, e = int(bounds[i]), int(bounds[i + 1])
+        if s == e:
+            continue
+        es, ee = max(0, s - pad), min(H, e + pad)  # extended (haloed) range
+        sub = np.take(data, range(es, ee), axis=axis)
+        tasks.append((sub, size))
+        slices.append((s, e, es))
+
+    out = np.empty_like(data)
+    with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+        results = list(ex.map(_median_filter_chunk, tasks))
+
+    for (s, e, es), res in zip(slices, results):
+        valid = np.take(res, range(s - es, s - es + (e - s)), axis=axis)
+        np.copyto(np.take(out, range(s, e), axis=axis), valid) if False else None
+        # assign the valid (halo-cropped) slab back
+        idx = [slice(None)] * data.ndim
+        idx[axis] = slice(s, e)
+        out[tuple(idx)] = valid
+    return out
 
 def calculate_shift_new(spectra,
                        aligning_range=None,
