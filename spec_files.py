@@ -26,7 +26,249 @@ class SpecFile:
         except FileNotFoundError:
             print(f"File {self.filename} not found.")
     
-    def _read_spec_file(self, scans_selected, scans_from_same_run=False):
+
+
+    def _read_spec_file(self, scans_selected, scans_from_same_run=False, read_c_lines=True):
+        """
+        Extract scan data, column names, motor names/values, #C metadata and the
+        date from a .spec file into an xarray.Dataset.
+
+        Parameters
+        ----------
+        scans_selected : str or list
+            'all' to read every scan, or a list/space-separated string of scan
+            identifiers. An identifier of the form '123.2' selects the 2nd
+            occurrence of scan 123.
+        scans_from_same_run : bool
+            If True, scans are identified by their intra-run number parsed from
+            the '#S N  Scan RUN:SCAN' header; otherwise by the '#S N' number.
+
+        Returns
+        -------
+        xarray.Dataset
+            One DataArray per scan (dims ['points', 'datasets']), with motor and
+            #C values stored in .attrs, plus a dataset-level 'date' attribute.
+        """
+
+        # ---- nested helper: parse #C metadata (unchanged from original) -------
+        def _parse_c_params(scan_text):
+            matches = re.findall(r"#C[ \t]?(.*?)(?=#C|\n#|\Z)", scan_text)
+            params = {}
+            section = None
+            for raw in matches:
+                line = raw.strip()
+                if not line:
+                    continue
+                start_m = re.match(r"--\s*(.+?)\s+start\s*$", line, re.IGNORECASE)
+                end_m = re.match(r"--\s*(.+?)\s+end\s*$", line, re.IGNORECASE)
+                if start_m:
+                    section = start_m.group(1).strip().lower().replace(' ', '_')
+                    continue
+                if end_m:
+                    section = None
+                    continue
+                if line.startswith('/'):
+                    key, value = 'raw_file', line
+                else:
+                    parts = re.split(r'\s{2,}', line)
+                    if len(parts) >= 2:
+                        key, value = parts[0].strip(), parts[-1].strip()
+                    else:
+                        key, value = line, None
+                    if value == 'True':
+                        value = True
+                    elif value == 'False':
+                        value = False
+                    elif value is not None:
+                        try:
+                            value = float(value)
+                        except ValueError:
+                            pass
+                if key in params:
+                    raise ValueError(
+                        f"Duplicate #C parameter name '{key}' found while parsing scan header "
+                        f"(section: {section!r}). Remove the prefix-based flattening or rename "
+                        f"one of the colliding keys to resolve this."
+                    )
+                params[key] = value
+            return params
+
+        content = self.file_content
+        if content is None:
+            raise ValueError(f"File content is empty; could not read {self.filename!r}.")
+
+        # ---- 1. Split the whole file into scan blocks in a SINGLE pass ---------
+        # group(1) = the '#S' file number
+        # group(2) = the intra-run scan number ('Scan RUN:SCAN'), or None if absent
+        header_re = re.compile(r'^#S[ \t]+(\d+)(?:[ \t]+Scan[ \t]+\d+:(\d+))?', re.MULTILINE)
+        headers = list(header_re.finditer(content))
+        if not headers:
+            raise ValueError(f"No '#S' scan headers found in {self.filename!r}.")
+
+        starts = [m.start() for m in headers]
+        ends = starts[1:] + [len(content)]          # each block ends where the next '#S' begins
+
+        blocks = []                                  # [(key, start, end), ...]
+        key_to_blocks = {}                           # key -> [block indices] (handles duplicates)
+        for i, m in enumerate(headers):
+            key = m.group(2) if scans_from_same_run else m.group(1)
+            blocks.append((key, starts[i], ends[i]))
+            if key is not None:
+                key_to_blocks.setdefault(key, []).append(i)
+
+        # ---- 2. Decide which blocks to process, and the label for each --------
+        selected = []                                # [(label, block_index), ...]
+        if scans_selected == 'all':
+            for i, (key, _, _) in enumerate(blocks):
+                if key is None:                      # header without the expected format
+                    continue
+                selected.append((key, i))
+        else:
+            scans = scans_selected.split() if isinstance(scans_selected, str) else scans_selected
+            for scan in scans:
+                progressive_number = 1
+                scan_key = str(scan)
+                if isinstance(scan, str) and re.match(r'^\d+\.\d+$', scan):
+                    scan_key, prog = scan.split('.')
+                    progressive_number = int(prog)
+                idxs = key_to_blocks.get(scan_key, [])
+                if not idxs:
+                    print(f"Scan {scan} not found.")
+                    continue
+                if progressive_number > len(idxs):
+                    print(f"Scan {scan}: only {len(idxs)} occurrence(s) found; using the first.")
+                    progressive_number = 1
+                selected.append((scan_key, idxs[progressive_number - 1]))
+
+        # ---- 3. File-level date, extracted ONCE (not once per scan) -----------
+        date_match = re.search(r'#D (.+)', content)
+        date = date_match.group(1) if date_match else None
+
+        # ---- 3b. Global motor names from the preamble (before the first #S) ---
+        # Many beamlines write the '#O' motor-name block only once, in the file
+        # header, and then only the per-scan '#P' value lines inside each block.
+        # Parse those names once here; they serve as a fallback for any scan
+        # block that has no '#O' lines of its own. A block with its own '#O'
+        # still overrides this, so files that repeat '#O' per scan are unaffected.
+        # Empty tokens (from trailing whitespace, e.g. '#O2 AD  ') are dropped so
+        # the name count matches the '#P' value count.
+        preamble = content[:starts[0]]
+        global_motnames = []
+        for line in re.findall(r'#O\d+[ \t]{1,2}(.+)', preamble):
+            global_motnames.extend(name for name in line.split('  ') if name.strip())
+
+        # ---- 4. Parse each selected block exactly once ------------------------
+        ds = xr.Dataset()
+        for label, block_idx in selected:
+            _, start, end = blocks[block_idx]
+            scan_text = content[start:end]           # the only slice we make, once per scan
+
+            # column names (#L)
+            col_match = re.search(r'#L\s{1,2}(.+)', scan_text)
+            colnames = col_match.group(1).split('  ') if col_match else []
+
+            # motor names (#O...) and values (#P...)
+            # Prefer '#O' lines inside the scan block (some beamlines repeat them
+            # per scan); fall back to the global preamble names otherwise.
+            motnames = []
+            for line in re.findall(r'#O\d+\s{1,2}(.+)', scan_text):
+                motnames.extend(name for name in line.split('  ') if name.strip())
+            if not motnames:
+                motnames = global_motnames
+
+            motvals = []
+            for line in re.findall(r'#P\d+\s{1,2}(.+)', scan_text):
+                motvals.extend(
+                    float(v) if v != "b'ERR'" else np.nan
+                    for v in re.split(r'\s{1,2}', line.strip())
+                )
+
+            # Names and values are paired positionally (#O0↔#P0, #O1↔#P1, ...).
+            # A count mismatch means silent misalignment, so warn rather than
+            # zip-truncate quietly.
+            if motnames and len(motnames) != len(motvals):
+                print(
+                    f"Scan {label}: {len(motnames)} motor name(s) but "
+                    f"{len(motvals)} value(s); pairing the first "
+                    f"{min(len(motnames), len(motvals))} and dropping the rest."
+                )
+
+            # #C metadata
+            if read_c_lines:
+                cparams = _parse_c_params(scan_text)
+
+            # numerical data (fast parser, see helper below)
+            data = self._parse_data_block(scan_text)
+            if data.size == 0:
+                print(f"Scan {label}: no numerical data found, skipping.")
+                continue
+
+            # guard against label collisions (e.g. a file with repeated intra-run
+            # scan numbers). Keep the first occurrence and warn, rather than
+            # silently overwriting it.
+            var_name = f'scan_{label}'
+            if var_name in ds.data_vars:
+                print(f"Warning: two scans map to '{var_name}'; keeping the first, ignoring the duplicate.")
+                continue
+
+            # build the DataArray for this scan
+            da = xr.DataArray(
+                data,
+                dims=['points', 'datasets'],
+                coords={'points': np.arange(data.shape[0]), 'datasets': colnames},
+            )
+            da.attrs.update({name: value for name, value in zip(motnames, motvals)})
+            if read_c_lines:
+                da.attrs.update(cparams)
+            da.attrs['scan'] = label
+            ds[var_name] = da
+
+        ds.attrs['date'] = date
+        return ds
+ 
+ 
+    @staticmethod
+    def _parse_data_block(scan_text):
+        """
+        Parse the numerical rows of a scan block into a 2-D float array.
+    
+        Fast path: split each line and let numpy do a single C-level float
+        conversion. This is generally several times faster than np.loadtxt, which
+        parses line-by-line in Python.
+    
+        Fallback: if a stray non-numeric token (e.g. 'ERR') or a ragged row makes
+        the fast path fail, parse token-by-token and pad short rows with NaN so the
+        result is always rectangular.
+        """
+        data_lines = [
+            ln for ln in scan_text.split('\n')
+            if ln and not ln.startswith('#') and not ln.startswith(' ')
+        ]
+        if not data_lines:
+            return np.empty((0, 0))
+    
+        try:
+            # np.loadtxt is C-accelerated on numpy >= 1.23 and is the fastest option.
+            return np.loadtxt(data_lines, ndmin=2)
+        except ValueError:
+            # robust fallback for stray non-numeric tokens (e.g. 'ERR') or ragged rows
+            rows = [[SpecFile._to_float(tok) for tok in ln.split()] for ln in data_lines]
+            width = max(len(r) for r in rows)
+            arr = np.full((len(rows), width), np.nan)
+            for i, r in enumerate(rows):
+                arr[i, :len(r)] = r
+            return arr
+ 
+    
+    @staticmethod
+    def _to_float(tok):
+        try:
+            return float(tok)
+        except ValueError:
+            return np.nan
+
+
+    def _read_spec_file_old(self, scans_selected, scans_from_same_run=False):
         """
         This method extracts scan data, column names, motor names and values, and the date from a .spec file.
         It then organizes this information into an xarray.Dataset.
@@ -192,21 +434,23 @@ class SpecFile:
         ds.attrs['date'] = date
         return ds
 
-    def extract_data(self,scans, x_name, y_name, norm_name, motors_dict=None,
-                     scans_from_same_run=False):
+
+    def extract_data(self, scans, x_name, y_name, norm_name, var_names=None,
+                     motors_dict=None, scans_from_same_run=False, read_c_lines=True):
         """
         Extract and normalize data based on specified x, y, and normalization datasets,
         and include specified motor names and values.
 
         Parameters
         ----------
-        x_name : str
-            Name of the dataset to be used as x-axis.
-        y_name : str
-            Name of the dataset to be used as y-axis.
-        norm_name : str
-            Name of the dataset to be used for normalization.
-        motors : dict
+        x_name, y_name, norm_name : str or list of str
+            Name(s) of the dataset(s) to use as x-axis, y-axis and normalization.
+        var_names : list of str, optional
+            Explicit labels for the 'variable' coordinate, one per selected column,
+            ordered as x-columns, then y-columns, then norm-columns. If None, labels
+            default to 'x'/'y'/'norm' for a string input and to the dataset names
+            themselves for a list input.
+        motors_dict : dict
             Dictionary mapping motor names to their corresponding variable names.
 
         Returns
@@ -214,26 +458,49 @@ class SpecFile:
         xarray.Dataset
             Dataset containing the normalized data and specified motor values.
         """
-        print(f"\n-> Extracting and normalizing data from scans: {scans}.\n\tX-axis: {x_name}, Y-axis: {y_name}, Normalization: {norm_name}.")
-        ds = self._read_spec_file(scans_selected=scans, scans_from_same_run=scans_from_same_run)
+        print(f"\tExtracting data for run {self.run} from scans: {scans}. X-axis: {x_name}, Y-axis: {y_name}, Normalization: {norm_name}.")
+        ds = self._read_spec_file(scans_selected=scans, scans_from_same_run=scans_from_same_run, read_c_lines=read_c_lines)
         self.normalized_data = xr.Dataset()
-        
+
+        # Convert every name to a list of dataset names BEFORE taking any len(),
+        # otherwise len() on a string counts its characters.
+        def _as_list(name):
+            return [name] if isinstance(name, str) else list(name)
+
+        x_names = _as_list(x_name)
+        y_names = _as_list(y_name)
+        norm_names = _as_list(norm_name)
+        all_names = x_names + y_names + norm_names
+
+        # Build the 'variable' coordinate labels.
+        if var_names is None:
+            # Default: a string keeps its role label; a list uses the dataset names.
+            x_labels = ['x'] if isinstance(x_name, str) else list(x_name)
+            y_labels = ['y'] if isinstance(y_name, str) else list(y_name)
+            norm_labels = ['norm'] if isinstance(norm_name, str) else list(norm_name)
+            variable_labels = x_labels + y_labels + norm_labels
+        else:
+            variable_labels = list(var_names)
+            if len(variable_labels) != len(all_names):
+                raise ValueError(
+                    f"var_names has {len(variable_labels)} entries but "
+                    f"{len(all_names)} datasets were selected "
+                    f"(x: {len(x_names)}, y: {len(y_names)}, norm: {len(norm_names)})."
+                )
+
         for scan in ds.data_vars:
-            if x_name in ds[scan].datasets and y_name in ds[scan].datasets and norm_name in ds[scan].datasets:
-                x_data = np.copy(ds[scan].sel(datasets=x_name).values)
-                y_data = np.copy(ds[scan].sel(datasets=y_name).values)
-                norm_data = np.copy(ds[scan].sel(datasets=norm_name).values)
-                
-                # Concatenate x_data, y_data, and norm_data along a new dimension
-                data = np.stack([x_data, y_data, norm_data], axis=1)
-                
-                # Create the DataArray with multiple coordinates for the 'points' dimension
+            if all(name in ds[scan].datasets for name in all_names):
+                # Each selection is a length-N 1-D array; stacking on axis=1 gives (N, K),
+                # K = total selected datasets (x-columns + y-columns + norm-columns).
+                columns = [ds[scan].sel(datasets=name).values for name in all_names]
+                data = np.stack(columns, axis=1)
+
                 self.normalized_data[scan] = xr.DataArray(
                     data=data,
                     dims=['points', 'variable'],
                     coords={
-                    'points': np.arange(data.shape[0]),
-                    'variable': ['x', 'y', 'norm']
+                        'points': np.arange(data.shape[0]),
+                        'variable': variable_labels
                     }
                 )
                 self.normalized_data[scan].attrs['x_name'] = x_name
@@ -254,14 +521,62 @@ class SpecFile:
                         )
 
                 self.normalized_data[scan].attrs['date'] = ds.attrs['date']
-                self.normalized_data[scan].attrs['run'] = str(self.run)
+                if self.run is not None:
+                    self.normalized_data[scan].attrs['run'] = str(self.run)
                 self.normalized_data[scan].attrs['scan'] = ds[scan].attrs['scan']
                 self.normalized_data[scan].attrs['filename'] = self.filename
 
         return self.normalized_data
 
 
-    def save_to_hdf5(self, filename):
+
+    def order_by_parameter(self, parameter):
+        """
+        Order the dataset's DataArrays by one or more attributes.
+
+        Parameters
+        ----------
+        parameter : str or list of str
+            Attribute name(s) to order by. If a list is given, scans are
+            ordered by the first parameter; ties are broken by the second,
+            then the third, and so on.
+        """
+        if self.ds is None:
+            raise ValueError("No dataset provided.")
+
+        # Normalize to a list of parameters
+        if isinstance(parameter, str):
+            parameters = [parameter]
+        else:
+            parameters = list(parameter)
+
+        # Collect (scan_name, (value1, value2, ...)) pairs
+        scan_attr_pairs = []
+        for scan in self.ds.data_vars:
+            values = []
+            for param in parameters:
+                attr_value = self.ds[scan].attrs.get(param)
+                if attr_value is None:
+                    raise ValueError(f"Parameter '{param}' to order dataset not found in attributes of scan '{scan}'.")
+                values.append(attr_value)
+            scan_attr_pairs.append((scan, tuple(values)))
+
+        # Sort by the tuple of attribute values (lexicographic order)
+        scan_attr_pairs.sort(key=lambda x: x[1])
+
+        # Rebuild the dataset in the new order
+        new_ds = xr.Dataset()
+        for scan, _ in scan_attr_pairs:
+            new_ds[scan] = self.ds[scan].copy(deep=True)
+        self.ds = new_ds
+
+
+    def save_to_hdf5(self, filename,
+                     variable_names=None,
+                     additional_metadata=None,
+                     normalize_spectra=True,
+                     divide_normalization_by_value=1,
+                     metadata_to_save=None):
         """
         Save the xarray.Dataset to an HDF5 file with motor values as attributes.
 
@@ -275,15 +590,91 @@ class SpecFile:
         if self.normalized_data is None:
             raise ValueError("No dataset provided.")
         
-        self.normalized_data.to_netcdf(filename, engine='h5netcdf')
-        print(f"Dataset saved to {filename}")
+        if additional_metadata is None:
+            additional_metadata = {}
+        if not isinstance(additional_metadata, dict):
+            raise ValueError("additional_metadata must be a dictionary.")
+        if variable_names is None:
+            variable_names = []
 
-    def save_to_csv(self, filename, motor_names, motor_name_mapping,
-                                  metadata_in_csv=['Q', 'theta','2theta','phi','energy','polarization',
-                                                      'mirror','sample','B [T]', 'T [K]',],
-                                    set_metadata_value = None,
-                                    normalize_spectra=False,
-                                    divide_normalization_by_value=1,):
+
+        print(f"\n-> Saving dataset to .csv format.\n\tData will {'be normalized' if normalize_spectra else 'not be normalized'}. Normalization value will be divided by {divide_normalization_by_value}.")
+
+        if metadata_to_save is None:
+            # keep all metadata: collect all attribute keys from dataset and each DataArray
+            keep_keys = set()
+            for var in self.normalized_data.data_vars:
+                keep_keys.update(self.normalized_data[var].attrs.keys())
+                keep_keys.update(getattr(self.normalized_data, "attrs", {}).keys())
+        elif isinstance(metadata_to_save, (list, tuple, set)):
+            keep_keys = set(metadata_to_save)
+        else:
+            keep_keys = {str(metadata_to_save)}
+
+        new_ds = xr.Dataset()
+
+        for var_name in self.normalized_data.data_vars:
+            da = self.normalized_data[var_name]
+            if normalize_spectra:
+                y_values = da.sel(variable='y').values
+                error_values = da.sel(variable='error').values if 'error' in da.coords['variable'] else None
+                norm_values = da.sel(variable='norm').values
+                normalized_y = y_values / norm_values * divide_normalization_by_value
+                normalized_error = error_values / norm_values * divide_normalization_by_value if error_values is not None else None
+                da = da.copy(deep=True)
+                da.loc[dict(variable='y')] = normalized_y
+                if error_values is not None:
+                    da.loc[dict(variable='error')] = normalized_error
+            # deep copy the DataArray data and coords
+            # Copy only selected variables if variable_names provided, otherwise copy whole DataArray
+            if variable_names:
+                # Normalize variable_names to list
+                if not isinstance(variable_names, (list, tuple)):
+                    vars_requested = [str(variable_names)]
+                else:
+                    vars_requested = [str(v) for v in variable_names]
+
+                available_vars = [str(v) for v in da.coords['variable'].values]
+                vars_to_copy = [v for v in vars_requested if v in available_vars]
+
+                if len(vars_to_copy) == 0:
+                    # If none of the requested variables exist, fall back to copying everything
+                    print(f"\tWarning: none of requested variable_names {vars_requested} found in DataArray; copying all variables.")
+                    new_da = da.copy(deep=True)
+                else:
+                    # Preserve the order given in vars_to_copy using positional indices,
+                    # which is safe regardless of whether 'variable' is an indexed coord.
+                    indices = [list(available_vars).index(v) for v in vars_to_copy]
+                    new_da = da.isel(variable=indices).copy(deep=True)
+            else:
+                new_da = da.copy(deep=True)
+
+            
+            # filter attributes to only those requested
+            new_da.attrs = {k: v for k, v in new_da.attrs.items() if k in keep_keys}
+            # divide 'mirror' attribute by divide_normalization_by_value
+            if 'mirror' in new_da.attrs:
+                new_da.attrs['mirror'] = new_da.attrs['mirror'] / divide_normalization_by_value
+            new_ds[var_name] = new_da
+
+        # also filter dataset-level attributes if present
+        new_ds.attrs = {k: v for k, v in getattr(self.normalized_data, "attrs", {}).items() if k in keep_keys}
+        for data_var in self.normalized_data.data_vars:
+            da = new_ds[data_var]
+            da.attrs['normalization_divide_value'] = divide_normalization_by_value
+            for k, v in additional_metadata.items():
+                da.attrs[k] = v
+
+        # new_ds.attrs['units'] = units_names
+        new_ds.to_netcdf(filename, engine='h5netcdf')
+        print(f"\tDataset saved to {filename}")
+
+
+    def save_to_csv(self, filename, motors_dict=None,
+                                    normalize_spectra=True,
+                                    save_errorbars=False,
+                                    divide_normalization_by_value=1,
+                                    positive_energy_loss=True,):
         """
         Save the xarray.Dataset to a CSV file with columns 'Energy Loss (eV)', 'Intensity (arb. units)', and 'Error (arb. units)'.
         Include a header with the values of the specified motor parameters.
@@ -294,44 +685,42 @@ class SpecFile:
             The dataset to save.
         filename : str
             The name of the CSV file to save the dataset to.
-        motor_names : list of str
-            List of motor names to include in the header.
-        motor_name_mapping : dict
-            Dictionary mapping motor names in the dataset to metadata names written in the csv file.
-        metadata_in_csv : list of str
-            List of metadata attributes to include in the CSV file.
-        set_metadata_value : dict or None
-            Dictionary with fixed values for specific metadata to include in the CSV file.
-            If None, the default values from the dataset will be used.
-            Set metadata could be either single values or lists of values (if different for each scan).
+        motors_dict : dict
+            Dictionary mapping motor names in the dataset to motor names printed in the csv file.
         normalize_spectra : bool
             If True, normalize the spectra by the normalization dataset.
         divide_normalization_by_value : float
             Value to divide the normalization dataset by when normalizing the spectra (e.g. 1E6 for mirror at ESRF)
+        positive_energy_loss : bool
+            If True, set the direction of energy loss to positive. If False, set it to negative.
         """
+
+        print(f"\n-> Saving dataset to .csv format.\n\tData will {'be normalized' if normalize_spectra else 'not be normalized'}. Normalization value will be divided by {divide_normalization_by_value}.")
+        has_error = all(
+            'error' in self.normalized_data[scan].coords['variable'].values
+            for scan in self.normalized_data.data_vars
+        )
+        if not has_error and save_errorbars:
+            print("\tWarning: Not all scans have 'error' variable. Error bars will not be saved.")
+            save_errorbars = False
 
         # Ensure the filename ends with ".csv"
         if not filename.lower().endswith('.csv'):
             base, ext = os.path.splitext(os.path.basename(filename))
             if ext.lower() != '.csv':
-                print(f"Warning: Changing file extension to .csv for {filename}")
+                print(f"\tWarning: Changing file extension to .csv for {filename}")
                 filename = os.path.join(os.path.dirname(filename), base + '.csv')
             filename += '.csv'
 
-        # Extract the first scan name from self.normalized_data.data_vars
-        first_scan_name = list(self.normalized_data.data_vars)[0]
-        print(f"Saving dataset- Spectra will be normalized by {self.normalized_data[first_scan_name].attrs['norm_name']}, divided by {divide_normalization_by_value}.\n")
-        xname = str(self.normalized_data[first_scan_name].attrs['x_name'])
-        yname = str(self.normalized_data[first_scan_name].attrs['y_name'])
-        norm_name = str(self.normalized_data[first_scan_name].attrs['norm_name'])
+        first_scan = list(self.normalized_data.data_vars)[0]
 
         with open(filename, 'w', encoding='utf-8') as file:
 
             # Write the header with motor values
             # Collect motor values for all scans
-            motor_values_all_scans = {motor: [] for motor in motor_names}
+            motor_values_all_scans = {motor: [] for motor in motors_dict.values()}
             for scan in self.normalized_data.data_vars:
-                for motor in motor_names:
+                for motor in motors_dict.values():
                     if motor in self.normalized_data[scan].attrs:
                         motor_values_all_scans[motor].append(self.normalized_data[scan].attrs[motor])
                     else:
@@ -339,34 +728,22 @@ class SpecFile:
 
             header = ''
             # Write motor values in the header
-            for metadata in metadata_in_csv:
+            for metadata in motors_dict.keys():
                 header_parts = [metadata]
                 header_parts_1 = [' ' for _ in range(len(self.normalized_data.data_vars))]
                 header_parts_2 = []
-
-                if set_metadata_value is not None and metadata in set_metadata_value:
-                        if len(set_metadata_value[metadata])==1:
-                            value = set_metadata_value[metadata][0]
-                            header_parts_2 += [f"{value:.2f}" if isinstance(value, (int, float)) else str(value) 
-                                            for _ in range(len(self.normalized_data.data_vars))]
+                if metadata == 'mirror':
+                        if normalize_spectra:
+                            header_parts_2 += [f"{np.mean(self.normalized_data[scan].sel(variable='norm').values)/divide_normalization_by_value:.2f}" for i, scan in enumerate(self.normalized_data.data_vars)]
                         else:
-                            header_parts_2 += [f"{value:.2f}" if isinstance(value, (int, float)) else str(value)
-                                               for value in set_metadata_value[metadata]]
-                else:
-                    #value is not set by user, search it in the motor values saved in the dataset
-                    if metadata == 'mirror':
-                        # If a fixed value is provided for this metadata, use it for all scans
-                        header_parts_2 += [f"{np.mean(self.normalized_data[scan].sel(variable='norm').values)/divide_normalization_by_value:.2f}" for i, scan in enumerate(self.normalized_data.data_vars)]
+                            header_parts_2 += [f"{np.mean(self.normalized_data[scan].sel(variable='norm').values):.2f}" for i, scan in enumerate(self.normalized_data.data_vars)]
+                else:                
+                    if motors_dict[metadata] is not None:
+                        header_parts_2 += [(f"{value:.2f}" if isinstance(value, (int, float)) else str(value))
+                            for i, value in enumerate(motor_values_all_scans[motors_dict[metadata]])
+                        ]
                     else:
-                        if metadata in motor_name_mapping:
-                            #name of the origin metadata in the motor values is known
-                            if motor_name_mapping[metadata] is not None:
-                                header_parts_2 += [(f"{value:.2f}" if isinstance(value, (int, float)) else str(value))
-                                    for i, value in enumerate(motor_values_all_scans[motor_name_mapping[metadata]])
-                                ]
-                        else:
-                            header_parts_2 += [" "] * (len(self.normalized_data.data_vars))
-
+                        header_parts_2 += [" "] * (len(self.normalized_data.data_vars))
 
                 for idx in range(1, len(self.normalized_data.data_vars) * 2 + 1):
                     if idx % 2 == 1:
@@ -378,30 +755,44 @@ class SpecFile:
                 header += '\n'
 
             # Write a line of "Energy Loss" and {scan} alternating
-            header += ' ,'+','.join([f"{xname},{scan}" for scan in self.normalized_data.data_vars])
-            header += '\n'
-            units = ' ,'+','.join([' ,(arb. units)'] * len(self.normalized_data.data_vars))
+            if save_errorbars:
+                header += ' ,'+','.join([f"Energy Loss,{self.normalized_data[scan].attrs['run']},Error" for scan in self.normalized_data.data_vars])
+                header += '\n'
+                units = ' ,'+','.join(['(eV),(arb. units),(arb.units)'] * len(self.normalized_data.data_vars))
+            else:
+                header += ' ,'+','.join([f"Energy Loss,{self.normalized_data[scan].attrs['run']}" for scan in self.normalized_data.data_vars])
+                header += '\n'
+                units = ' ,'+','.join(['(eV),(arb. units)'] * len(self.normalized_data.data_vars))
             units += '\n'
             header += units
             file.write(f"{header}\n")
 
-            # Create a DataFrame to store all scans
-            data_frames = []
             # Stack all x and y values as adjacent columns
             all_data = []
             for scan in self.normalized_data.data_vars:
                 x_values = self.normalized_data[scan].sel(variable='x').values
                 y_values = self.normalized_data[scan].sel(variable='y').values
                 norm_values = self.normalized_data[scan].sel(variable='norm').values
-                if normalize_spectra:
-                    # Normalize the y-values by the norm values
-                    y_values = y_values / norm_values * divide_normalization_by_value
+                
+                error_values = self.normalized_data[scan].sel(variable='error').values if save_errorbars else None
 
-                # # Calculate the sum of y_values for x_values < 0 and x_values > 0
-                # x_values, y_values, norm_values,_ = self._set_direction_energy_loss(x_values, y_values,
-                #                                                                   norm_values=norm_values,
-                #                                                                   positive_energy_loss=positive_energy_loss)
-                all_data.append(np.column_stack((x_values, y_values)))
+                if normalize_spectra:
+                    # Normalize the y-values (and the errors) by the norm values
+                    y_values = y_values / norm_values * divide_normalization_by_value
+                    if save_errorbars:
+                        error_values = error_values / norm_values * divide_normalization_by_value 
+
+                # Calculate the sum of y_values for x_values < 0 and x_values > 0
+                x_values, y_values, norm_values, error_values, _ = self._set_direction_energy_loss(x_values, y_values,
+                                                                                  norm_values=norm_values,
+                                                                                  error_values=error_values,
+                                                                                  positive_energy_loss=positive_energy_loss)
+                
+                if save_errorbars:
+                    # Calculate error bars as sqrt(y_values) for Poisson statistics
+                    all_data.append(np.column_stack((x_values, y_values, error_values)))
+                else:
+                    all_data.append(np.column_stack((x_values, y_values)))
 
             # Concatenate all data along the second axis
             concatenated_data = np.concatenate(all_data, axis=1)
@@ -410,8 +801,7 @@ class SpecFile:
             for row in concatenated_data:
                 file.write(' ,'+','.join(map(str, row)) + '\n')
 
-        print(f"Dataset saved to {filename}")
-    
+        print(f"\tDataset saved to {filename}")
 
 
 
