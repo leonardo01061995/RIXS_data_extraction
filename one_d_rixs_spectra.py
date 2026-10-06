@@ -15,6 +15,123 @@ from IPython.display import display
 from static_functions import calculate_shift_new, calculate_shift_mccc,  _find_aligning_range, check_variations_parameters
 
 
+"""
+Configuration dataclasses for the RIXS pipeline.
+ 
+Groups the sprawling keyword arguments of the alignment and saving methods into
+small, typed, self-validating objects. Fields and defaults mirror the current
+signatures in one_d_rixs_spectra.py, so these are drop-in replacements for the
+loose kwargs / config dicts.
+ 
+Notes
+-----
+* Enums (ShiftPostprocess, FitFunction) make the allowed sets both *validated*
+  and *enumerable* (a GUI dropdown can read the members directly).
+* __post_init__ accepts plain strings too and coerces them to the enum, so an
+  existing dict-based run script keeps working: CrossCorrAlignment(**old_dict).
+* Mutable fields use field(default_factory=...) so instances never share state.
+"""
+ 
+# from __future__ import annotations          # lets the annotations stay valid on 3.9+
+ 
+# from dataclasses import dataclass, field
+# from enum import Enum
+# from typing import Any
+ 
+ 
+# # ----------------------------------------------------------------------------
+# # Enumerated choices (single source of truth for the allowed values)
+# # ----------------------------------------------------------------------------
+# class ShiftPostprocess(str, Enum):
+#     """How per-image shifts are post-processed after cross-correlation."""
+#     NONE = "none"
+#     FIT = "fit"
+#     SMOOTH = "smooth"
+#     INTERP = "interp"
+ 
+ 
+# class FitFunction(str, Enum):
+#     """Line shape used by the elastic-line fitting alignment."""
+#     GAUSSIAN = "gaussian"
+#     PSEUDOVOIGT = "pseudovoigt"
+ 
+ 
+# # ----------------------------------------------------------------------------
+# # Alignment
+# # ----------------------------------------------------------------------------
+# @dataclass
+# class CrossCorrAlignment:
+#     """
+#     Options for cross-correlation alignment
+#     (Generated_1D_RIXS_Spectra.align_spectra).
+#     """
+#     aligning_range: tuple[int, int] | None = None   # None -> auto-detected
+#     shift_postprocess: ShiftPostprocess = ShiftPostprocess.NONE
+#     correlation_batch_size: int = 10
+#     poly_order: int = 1
+#     plot: bool = False
+ 
+#     def __post_init__(self):
+#         # coerce a plain string ('smooth') or bad value ('^none') -> enum or clear error
+#         self.shift_postprocess = ShiftPostprocess(self.shift_postprocess)
+#         if self.correlation_batch_size < 1:
+#             raise ValueError("correlation_batch_size must be >= 1")
+#         if self.poly_order < 0:
+#             raise ValueError("poly_order must be >= 0")
+#         if self.aligning_range is not None:
+#             self.aligning_range = tuple(self.aligning_range)   # list from JSON -> tuple
+#             lo, hi = self.aligning_range
+#             if lo >= hi:
+#                 raise ValueError(f"aligning_range must be (low, high) with low < high, got {self.aligning_range}")
+ 
+ 
+# @dataclass
+# class FitAlignment:
+#     """
+#     Options for elastic-line fitting alignment
+#     (RIXS_Spectra.align_spectra(method='fitting') -> _align_spectra_fitting).
+#     """
+#     resolution: float = 0.1
+#     fit_function: FitFunction = FitFunction.GAUSSIAN
+#     plot: bool = False
+ 
+#     def __post_init__(self):
+#         self.fit_function = FitFunction(self.fit_function)
+#         if self.resolution <= 0:
+#             raise ValueError("resolution must be > 0")
+ 
+ 
+# # ----------------------------------------------------------------------------
+# # Saving
+# # ----------------------------------------------------------------------------
+# @dataclass
+# class SaveHDF5Options:
+#     """Options for save_to_hdf5 (both Generated_1D_RIXS_Spectra and RIXS_Spectra)."""
+#     normalize_spectra: bool = False
+#     divide_normalization_by_value: float = 1.0
+#     variable_names: list[str] = field(default_factory=list)      # [] -> save all variables
+#     additional_metadata: dict[str, Any] = field(default_factory=dict)
+#     metadata_to_save: list[str] | None = None                    # None -> keep all attributes
+ 
+#     def __post_init__(self):
+#         if self.divide_normalization_by_value == 0:
+#             raise ValueError("divide_normalization_by_value must be non-zero")
+ 
+ 
+# @dataclass
+# class SaveCSVOptions:
+#     """Options for save_to_csv."""
+#     motors_dict: dict[str, str] | None = None
+#     normalize_spectra: bool = True
+#     save_errorbars: bool = False
+#     divide_normalization_by_value: float = 1.0
+#     positive_energy_loss: bool = True
+ 
+#     def __post_init__(self):
+#         if self.divide_normalization_by_value == 0:
+#             raise ValueError("divide_normalization_by_value must be non-zero")
+        
+
 
 class Generated_1D_RIXS_Spectra:
     def __init__(self, ds, energy_axis_calculated=False):

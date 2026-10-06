@@ -29,30 +29,77 @@ from static_functions import _determine_polarization, _parallel_median_filter
 class RIXS_Image(ABC):
 
     def __init__(self):
+        """
+        Initialize the shared state common to all RIXS image sources.
+
+        Subclasses call this via `super().__init__()` before loading any
+        file-specific data.
+
+        Sets
+        ----
+        self.imgs_processed : None
+            Placeholder for the processed image stack, populated later by
+            `single_photon_counting` or `_remove_bkg_and_filter`.
+        self.normalization_factor : None
+            Placeholder for the normalization factor, populated later by
+            `_get_normalization_factor`.
+        """
         self.imgs_processed = None
         self.normalization_factor = None
 
     @abstractmethod
     def _get_raw_data(self):
+        """
+        Load raw detector images for this run and store them on the instance.
+
+        Concrete subclasses must implement this to read from their specific
+        file format (EDF, HDF5, NeXus, ...) and populate `self.raw_data` as a
+        3D numpy array of shape (n_images, height, width), even when only a
+        single image is present.
+        """
         pass
 
     @abstractmethod
     def _get_run_number(self):
+        """
+        Determine the run number for this image source and store it on the
+        instance as `self.run_number`.
+        """
         pass
 
     @abstractmethod
     def _get_normalization_factor(self):
+        """
+        Determine the beam-intensity normalization factor for this image
+        source and store it on the instance as `self.normalization_factor`.
+        """
         pass
 
     @abstractmethod
     def _get_attributes(self):
+        """
+        Read experimental metadata (motor positions, polarization, energy,
+        etc.) for this image source and store it on the instance as
+        `self.attributes`, a dict keyed by attribute name.
+        """
         pass
 
     @abstractmethod
     def _get_energy(self):
+        """
+        Determine the incident photon energy for this image source and
+        store it on the instance as `self.energy`.
+        """
         pass
 
     def plot(self):
+        """
+        Placeholder for a generic plotting entry point.
+
+        Not implemented and not currently overridden by any subclass in this
+        file — calling it does nothing. Consider removing if it is not
+        planned for future use, or implementing it if it is.
+        """
         pass
 
     def process_imgs(self,
@@ -61,6 +108,31 @@ class RIXS_Image(ABC):
                      no_spc_parameters={},
                      plot_generation=False
                      ):
+        """
+        Dispatch image processing to either the single-photon-counting
+        pipeline or the background-removal/filtering pipeline.
+
+        Parameters
+        ----------
+        use_spc : bool
+            If True, process images with `single_photon_counting`. If False,
+            process images with `_remove_bkg_and_filter`.
+        spc_parameters : dict, optional
+            Keyword arguments forwarded to `single_photon_counting` when
+            `use_spc` is True. Default {}.
+        no_spc_parameters : dict, optional
+            Keyword arguments forwarded to `_remove_bkg_and_filter` when
+            `use_spc` is False. Default {}.
+        plot_generation : bool, optional
+            If True, call `plot_generation` with the same parameters after
+            processing. Default False.
+
+        Returns
+        -------
+        tuple of (numpy.ndarray, numpy.ndarray or float)
+            imgs_processed : the processed image stack.
+            normalization_factor : the associated normalization factor(s).
+        """
         
         if use_spc:
             self.single_photon_counting(**spc_parameters)
@@ -74,11 +146,38 @@ class RIXS_Image(ABC):
         return self.imgs_processed, self.normalization_factor
 
     def plot_generation(self, use_spc):
+        """
+        Placeholder for diagnostic-plot generation after processing.
+
+        Base implementation does nothing; `DLS_Image` overrides this with an
+        actual multi-panel diagnostic plot. Other subclasses inherit this
+        no-op, so calling `process_imgs(..., plot_generation=True)` on them
+        has no visible effect.
+
+        Parameters
+        ----------
+        use_spc : bool
+            Whether single-photon-counting (True) or background subtraction
+            (False) was used, so an override can choose what to plot.
+        """
         pass
 
     @abstractmethod
     def _remove_bkg_and_filter(self,
                                **kwargs):
+        """
+        Process raw images via background subtraction and spike filtering,
+        as an alternative to single-photon counting.
+
+        Concrete subclasses must implement this to remove detector
+        background/dark current and filter spikes from `self.raw_data`,
+        populating `self.imgs_processed`.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Subclass-specific processing parameters.
+        """
         pass
 
     def single_photon_counting(
@@ -95,41 +194,65 @@ class RIXS_Image(ABC):
             dark_img=None,
             plot_raw_image=False):
         """
-        Process the raw image data using single photon counting technique.
-        Uses the centroid function to identify and locate photon hits.
-        
+        Process raw detector images into a photon-counted 2D histogram using the
+        single-photon-counting (centroiding) technique.
+
+        Crops the raw data to the given ROI, optionally subtracts a flat or
+        image/corner-based background, locates photon hits with `_centroid`, and
+        bins the resulting sub-pixel positions into a grid with `_bin`. The
+        per-photon positions are cached in `self.res` on first call, so calling
+        this again with different binning parameters does not redo the
+        centroiding step.
+
         Parameters
         ----------
         curve_a : float
-            Coefficient that represents the linear (first-order) coefficient of the slope
-        curve_b : float
-            Coefficient that represents the quadratic (2nd-order) coefficient of the slope
-        roi_x : tuple of int
-            Region of interest along the x-axis
-        roi_y : tuple of int
-            Region of interest along the y-axis
-        roi_x_for_dark : tuple of int
-            Region of interest along the x-axis for dark image subtraction
-        roi_y_for_dark : tuple of int
-            Region of interest along the y-axis for dark image subtraction
-        factor_ADC : float
-            Factor to convert ADU to electrons
+            Linear (first-order) curvature correction coefficient.
+        curve_b : float, optional
+            Quadratic (second-order) curvature correction coefficient. Default 0.
+        roi_x : tuple of int, optional
+            (start, end) region of interest along the x-axis. Default (0, 2048).
+        roi_y : tuple of int, optional
+            (start, end) region of interest along the y-axis. Default (0, 2048).
+        roi_x_for_dark : tuple of int, optional
+            (start, end) region along x used to scale the dark image when
+            `subtract_background_from_img` is True. Default (1600, 1800).
+        roi_y_for_dark : tuple of int, optional
+            (start, end) region along y used to scale the dark image when
+            `subtract_background_from_img` is True. Default (250, 1800).
         subdivide_bins_factor_x : float, optional
-            Factor by which to subdivide the bins along the x-axis
+            Number of sub-pixel bins per pixel along x. Default 1.
         subdivide_bins_factor_y : float, optional
-            Factor by which to subdivide the bins along the y-axis
-        vertical_shifts : float
-            vertical shifts to be subtracted from y-coordinates, coming from 
-            cross-correlation. leave empty if cross-corr has not been done yet.
+            Number of sub-pixel bins per pixel along y. Default 2.7.
+        factor_ADC : float, optional
+            Factor to convert ADU to electrons. Default 0.55.
+        vertical_shift : float, optional
+            Vertical shift (in pixels) subtracted from the y-coordinates of photon
+            positions, typically from cross-correlation between images. Leave at
+            0 if cross-correlation has not been performed yet. Default 0.
         subtract_background_from_img : bool, optional
-            If True, subtract background from a pre-processed dark image
+            If True, scale and subtract `dark_img` from each raw image before
+            centroiding. Default False.
+        subtract_background_from_corner : bool, optional
+            If True, estimate a flat background from a fixed detector corner and
+            subtract it (used for TPS data). Default False.
+        bkg : float, optional
+            Flat background value subtracted when neither
+            `subtract_background_from_img` nor `subtract_background_from_corner`
+            is set. Default 0.
         dark_img : numpy.ndarray, optional
-            Dark image to be subtracted from the raw image data
-            
+            Pre-processed dark image; required if `subtract_background_from_img`
+            is True. Default None.
+        plot_raw_image : bool, optional
+            If True, call `plot_raw_image()` after processing. Default False.
+
         Returns
         -------
-        numpy.ndarray
-            2D histogram array containing the photon counts in each bin
+        tuple of (numpy.ndarray, numpy.ndarray or float)
+            imgs_processed : stack of 2D photon-count histograms, one per input
+            image.
+            normalization_factor : normalization factor(s) for the images
+            (unchanged by this method).
         """
         # Make sure we have raw data to process
         if self.raw_data is None:
@@ -194,6 +317,27 @@ class RIXS_Image(ABC):
     
 
     def plot_raw_image(self, roi_y=(0,2048), roi_x=(0,2048)):
+        """
+        Display a diagnostic view of the raw detector image: a 2D image
+        panel plus its vertical and horizontal average profiles.
+
+        If `self.raw_data` holds a stack of images (3D array), they are
+        summed over the stack before display.
+
+        Parameters
+        ----------
+        roi_y : tuple of int, optional
+            (start, end) region of interest along the y-axis. Default (0, 2048).
+        roi_x : tuple of int, optional
+            (start, end) region of interest along the x-axis. Default (0, 2048).
+
+        Returns
+        -------
+        tuple of (matplotlib.figure.Figure, tuple of matplotlib.axes.Axes)
+            fig : the created figure.
+            (ax1, ax2, ax3) : the vertical-average, image, and
+            horizontal-average axes, respectively.
+        """
         fig = plt.figure(figsize=(5, 5))
         gs = fig.add_gridspec(2, 2, width_ratios=[1, 2], height_ratios=[1, 2])
 
@@ -244,36 +388,44 @@ class RIXS_Image(ABC):
         curve_b=0,
     ):
         """
+        Identify single-photon events in a 2D detector image via centroiding.
+
+        Candidate pixels are selected using intensity thresholds derived from
+        the photon energy. A 3x3 patch around each candidate is used to compute
+        a weighted sub-pixel centroid, and each event is classified as a single
+        or double photon hit based on total patch intensity.
+
         Parameters
         ----------
-        img : ndarray
-            2D detector image array containing photon hit data
+        img : numpy.ndarray
+            2D detector image (raw counts).
         energy : float
-            Energy of the incident photons in eV
+            Incident photon energy in eV, used to derive intensity thresholds.
         bkg_mean : float, optional
-            Mean value of the flat background to subtract from image, default 300.52
+            Flat background subtracted from `img` before centroiding. Default 0.
         factor_ADC : float, optional
-            Factor to convert ADU to electrons, default 0.56 (TPS uses electron-multiplied CCD)
+            ADU-to-electron conversion factor. Default 1.2 (ESRF value; TPS
+            typically uses ~0.55).
         factor_for_ghost_clouds : float, optional
-            Factor to discard ghost clouds, only present at TPS. If present, should be 200. For, ESRF, 0.
-        factor_SpotLOW : float, optional
-            Multiplication factor for low threshold (i.e. selects electron clouds whose sum is above this limit), default 0.4.
-            This factor is 0.4 at ESRF, but here we need to discard this strange clouds and need to be set above 200
+            Lower bound on the low-intensity threshold, used to discard "ghost
+            cloud" artifacts specific to TPS data. Use 0 for ESRF, ~200 for TPS.
+            Default 0.
         avoid_double : bool, optional
-            If True, ignore double photon events. If False or None, include them
-        image_size : tuple of int
-            Size of the 2D detector image as (height, width)
-        subdivide_bins_factor_x : float, optional
-            Factor by which to subdivide each pixel along x-axis for sub-pixel resolution, default 1.0
-        subdivide_bins_factor_y : float, optional
-            Factor by which to subdivide each pixel along y-axis for sub-pixel resolution, default 1.0
+            If True, disables double-event detection (no event is ever
+            classified as a double). Default False.
+        curve_a : float, optional
+            Linear curvature correction applied to the y-centroid. Default 0.
+        curve_b : float, optional
+            Quadratic curvature correction applied to the y-centroid. Default 0.
 
         Returns
         -------
-        tuple
-            (hist_p, photon_count) where:
-            - hist_p is the 2D histogram of photon positions with sub-pixel resolution
-            - photon_count is the total number of detected photons
+        tuple of (list, list)
+            res_shifted : list of (y, x) tuples with the sub-pixel positions of
+            all detected photons. Double events are appended twice, matching
+            the convention expected by `_bin`.
+            double_shifted : list of (y, x) tuples with the positions of
+            double-photon events only.
         """
 
         SpotLOW = max(0.4 * energy / 3.6 / factor_ADC, factor_for_ghost_clouds)  # Multiplication factor * ADU/photon
@@ -508,36 +660,43 @@ class RIXS_Image(ABC):
         curve_b=0,
     ):
         """
+        Reference (non-vectorized) implementation of `_centroid`, kept for
+        validation purposes. Loops over candidate pixels one at a time instead
+        of using the vectorized patch extraction in `_centroid`; produces the
+        same results, just slower. See `_centroid` for the full parameter and
+        return documentation, which applies identically here.
+
         Parameters
         ----------
-        img : ndarray
-            2D detector image array containing photon hit data
+        img : numpy.ndarray
+            2D detector image (raw counts).
         energy : float
-            Energy of the incident photons in eV
+            Incident photon energy in eV, used to derive intensity thresholds.
         bkg_mean : float, optional
-            Mean value of the flat background to subtract from image, default 300.52
+            Flat background subtracted from `img` before centroiding. Default 0.
         factor_ADC : float, optional
-            Factor to convert ADU to electrons, default 0.56 (TPS uses electron-multiplied CCD)
+            ADU-to-electron conversion factor. Default 1.2 (ESRF value; TPS
+            typically uses ~0.55).
         factor_for_ghost_clouds : float, optional
-            Factor to discard ghost clouds, only present at TPS. If present, should be 200. For, ESRF, 0.
-        factor_SpotLOW : float, optional
-            Multiplication factor for low threshold (i.e. selects electron clouds whose sum is above this limit), default 0.4.
-            This factor is 0.4 at ESRF, but here we need to discard this strange clouds and need to be set above 200
+            Lower bound on the low-intensity threshold, used to discard "ghost
+            cloud" artifacts specific to TPS data. Use 0 for ESRF, ~200 for TPS.
+            Default 0.
         avoid_double : bool, optional
-            If True, ignore double photon events. If False or None, include them
-        image_size : tuple of int
-            Size of the 2D detector image as (height, width)
-        subdivide_bins_factor_x : float, optional
-            Factor by which to subdivide each pixel along x-axis for sub-pixel resolution, default 1.0
-        subdivide_bins_factor_y : float, optional
-            Factor by which to subdivide each pixel along y-axis for sub-pixel resolution, default 1.0
+            If True, disables double-event detection (no event is ever
+            classified as a double). Default False.
+        curve_a : float, optional
+            Linear curvature correction applied to the y-centroid. Default 0.
+        curve_b : float, optional
+            Quadratic curvature correction applied to the y-centroid. Default 0.
 
         Returns
         -------
-        tuple
-            (hist_p, photon_count) where:
-            - hist_p is the 2D histogram of photon positions with sub-pixel resolution
-            - photon_count is the total number of detected photons
+        tuple of (list, list)
+            res_shifted : list of (y, x) tuples with the sub-pixel positions of
+            all detected photons. Double events are appended twice, matching
+            the convention expected by `_bin`.
+            double_shifted : list of (y, x) tuples with the positions of
+            double-photon events only.
         """
 
         SpotLOW = max(0.4 * energy / 3.6 / factor_ADC, factor_for_ghost_clouds)  # Multiplication factor * ADU/photon
@@ -597,20 +756,34 @@ class RIXS_Image(ABC):
         subdivide_bins_factor_y,
         vertical_shift = 0):
         """
-        p_pos_list : list
-            A list containing the (x, y) coordinates of photons.
+        Bin a list of sub-pixel photon positions into a 2D histogram.
+
+        Parameters
+        ----------
+        p_pos_list : list of tuple
+            (y, x) sub-pixel photon coordinates, as returned by `_centroid`.
         image_size_h : int
-            The height of the 2D image.
+            Width of the original detector image (x-extent / number of
+            columns), in pixels.
         image_size_v : int
-            The width of the 2D image.
+            Height of the original detector image (y-extent / number of
+            rows), in pixels.
         subdivide_bins_factor_x : float
-            The number of sub-pixels in which each pixel is divided along the x-axis.
+            Number of sub-pixel bins per pixel along the x-axis.
         subdivide_bins_factor_y : float
-            The number of sub-pixels in which each pixel is divided along the y-axis.
-        vertical_shifts : float, optional
-            A float number representing the vertical shifts to be applied to the y-coordinates of the photon positions. 
-            These shifts are typically derived from cross-correlation analysis.
-            If cross-correlation has not been performed, this parameter can be left empty. 
+            Number of sub-pixel bins per pixel along the y-axis.
+        vertical_shift : float, optional
+            Vertical shift (in pixels) subtracted from the y-coordinates of
+            the photon positions before binning, typically derived from
+            cross-correlation analysis. Leave at 0 if cross-correlation has
+            not been performed. Default 0.
+
+        Returns
+        -------
+        tuple of (numpy.ndarray, int)
+            hist_p : 2D histogram of photon counts, dtype float32, shape
+            (image_size_v * subdivide_bins_factor_y, image_size_h * subdivide_bins_factor_x).
+            photon_count : total number of photon positions binned.
         """
         # Check if p_pos_list is empty
         if not p_pos_list:
@@ -686,6 +859,18 @@ class EDF_Image(RIXS_Image):
         self._get_attributes()
 
     def _get_raw_data(self):
+        """
+        Load a raw ESRF detector image from an EDF file.
+
+        Reads the image via `fabio`, flips it vertically to match the
+        expected orientation, and reorganizes the file header into
+        `self.header`. Adds a leading axis if the loaded image is 2D.
+
+        Returns
+        -------
+        numpy.ndarray
+            The loaded raw image, shape (n_images, height, width).
+        """
         file = fabio.open(self.file_path)
         self.raw_data = np.flipud(file.data)
         self.header = self._reorganize_header(file.header)
@@ -788,6 +973,26 @@ class EDF_Image(RIXS_Image):
             subtract_background_from_corner=False,
             dark_img=None,
             plot_raw_image=False):
+        """
+        ESRF-specific wrapper around `RIXS_Image.single_photon_counting`.
+
+        Forces `factor_ADC=1.2`, a fixed flat background of 300.52, and
+        disables `subtract_background_from_img`/`subtract_background_from_corner`,
+        since ESRF images use a flat background rather than a dark-image
+        subtraction. Emits a warning if `subtract_background_from_img` is
+        True or if a non-default `factor_ADC` was requested.
+
+        Parameters
+        ----------
+        See `RIXS_Image.single_photon_counting` for the full parameter list.
+        ROI, binning, and photon-counting parameters behave identically;
+        only the background-handling defaults differ for ESRF data.
+
+        Returns
+        -------
+        tuple of (numpy.ndarray, numpy.ndarray or float)
+            Same as `RIXS_Image.single_photon_counting`.
+        """
         
         if subtract_background_from_img:
             print("Warning: ESRF images do NOT need a dark image. Not using it. Setting flat background to 300.52...")
@@ -810,6 +1015,27 @@ class EDF_Image(RIXS_Image):
     
     @staticmethod
     def _reorganize_header(header):
+        """
+        Flatten an EDF header into a single dict of scalar/string values.
+
+        The EDF header stores motor and counter names/positions as
+        space-separated strings under 'counter_mne'/'motor_mne' (names) and
+        'counter_pos'/'motor_pos' (values). This unzips those parallel lists
+        and merges them into the header dict as individual
+        `{motor_or_counter_name: float_value}` entries, alongside all other
+        header fields (kept as strings).
+
+        Parameters
+        ----------
+        header : dict
+            Raw EDF header as returned by `fabio.open(...).header`.
+
+        Returns
+        -------
+        dict
+            Flattened header: string values for ordinary fields, plus one
+            float entry per named motor/counter.
+        """
         # Keys that need special handling (splitting into lists)
         keys_to_split = ['counter_mne', 'motor_mne']
         values_to_split = ['counter_pos', 'motor_pos']
@@ -835,6 +1061,18 @@ class EDF_Image(RIXS_Image):
 
 class TPS_Image(RIXS_Image):
     def __init__(self, file_path, file_path_background = None):
+        """
+        Load a TPS detector image and its associated metadata.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the HDF5 file containing the raw detector image(s).
+        file_path_background : str, optional
+            Path to a background/dark HDF5 file. Stored on
+            `self.file_path_background` but not otherwise used within this
+            class. Default None.
+        """
         super().__init__()
         self.file_path = file_path
         self.file_path_background = file_path_background if file_path_background is not None else None
@@ -847,6 +1085,20 @@ class TPS_Image(RIXS_Image):
         self._get_energy()
 
     def _get_raw_data(self):
+        """
+        Load raw detector images from the TPS HDF5 file.
+
+        Reads the "data" dataset, adds a leading axis if only a single 2D
+        image is present, and rotates each image 90 degrees clockwise to
+        match the expected orientation. Result is stored on `self.raw_data`.
+
+        Raises
+        ------
+        FileNotFoundError
+            If `self.file_path` does not exist.
+        ValueError
+            If the loaded data is not 2D or 3D.
+        """
         if not os.path.exists(self.file_path):
             raise FileNotFoundError(f"The file {self.file_path} does not exist.")
 
@@ -863,12 +1115,15 @@ class TPS_Image(RIXS_Image):
 
     def _get_run_number(self):
         """
-        Get the run number from the image file.
-        
-        Returns
-        -------
-        int
-            Run number of the image file
+        Get the run number from the image file and store it on the instance.
+
+        Sets `self.run_number` from the "f" attribute. Does not return a
+        value (implicitly returns None) — read `self.run_number` afterwards.
+
+        Raises
+        ------
+        ValueError
+            If no "f" attribute is present in `self.attributes`.
         """
         if "f" not in self.attributes:
             raise ValueError("No run number found in the image file")
@@ -878,12 +1133,17 @@ class TPS_Image(RIXS_Image):
 
     def _get_attributes(self):
         """
-        Get the attributes of the image file.
-        
-        Returns
-        -------
-        dict
-            Dictionary containing the attributes of the image file
+        Parse the image file's header attributes and store them on the instance.
+
+        Reads the 'header' HDF5 attribute (a colon/comma-separated string of
+        "name value" pairs) and populates `self.attributes` as a dict of
+        floats keyed by attribute name. Does not return a value (implicitly
+        returns None) — read `self.attributes` afterwards.
+
+        Raises
+        ------
+        ValueError
+            If `self.file_path` is None.
         """
         if self.file_path is not None:
             with h5py.File(self.file_path, "r") as file:
@@ -899,12 +1159,16 @@ class TPS_Image(RIXS_Image):
 
     def _get_energy(self):
         """
-        Get the energy from the image file.
-        
-        Returns
-        -------
-        float
-            Energy of the image file
+        Get the incident photon energy from the image file and store it on
+        the instance.
+
+        Sets `self.energy` from the "agm" attribute. Does not return a value
+        (implicitly returns None) — read `self.energy` afterwards.
+
+        Raises
+        ------
+        ValueError
+            If no "agm" attribute is present in `self.attributes`.
         """
         if "agm" not in self.attributes:
             raise ValueError("No energy found in the image file")
@@ -914,21 +1178,34 @@ class TPS_Image(RIXS_Image):
 
     def _get_normalization_factor(self):
         """
-        Get the normalization factor from the image file.
-        
+        Retrieve the normalization factor for the TPS image file, giving
+        precedence to a pre-computed value if one is stored in the file.
+
+        If the "normalization_factor" HDF5 attribute is present, it is used
+        directly. Otherwise, the factor is derived from the "Iph" attribute
+        (scaled by 1e9). Either way, the result is stored on
+        `self.normalization_factor` and also returned.
+
         Returns
         -------
         float
-            Normalization factor of the image file
+            The normalization factor.
+
+        Raises
+        ------
+        ValueError
+            If neither "normalization_factor" nor "Iph" can be found.
         """
         with h5py.File(self.file_path, "r") as file:
             if "normalization_factor" in file.attrs:
-                return file.attrs["normalization_factor"]
-            
+                self.normalization_factor = file.attrs["normalization_factor"]
+                return self.normalization_factor
+
         if "Iph" not in self.attributes:
             raise ValueError("No normalization factor found in the image file")
         else:
             self.normalization_factor = self.attributes["Iph"]*1E9
+        return self.normalization_factor
 
     def single_photon_counting(
             self, 
@@ -942,6 +1219,25 @@ class TPS_Image(RIXS_Image):
             subtract_background_from_corner=False,
             dark_img=None,
             plot_raw_image=False):
+        """
+        TPS-specific wrapper around `RIXS_Image.single_photon_counting`.
+
+        Warns if `factor_ADC` differs from the expected TPS value (0.55) or
+        if no background subtraction method
+        (`subtract_background_from_img`/`subtract_background_from_corner`)
+        is enabled, since TPS data requires background subtraction. Does
+        not otherwise change behavior — all parameters are passed straight
+        through to the base implementation.
+
+        Parameters
+        ----------
+        See `RIXS_Image.single_photon_counting` for the full parameter list.
+
+        Returns
+        -------
+        tuple of (numpy.ndarray, numpy.ndarray or float)
+            Same as `RIXS_Image.single_photon_counting`.
+        """
         
         if factor_ADC != 0.55:
             print("Warning: factor_ADC should be 0.55 for TPS data.")
@@ -968,6 +1264,16 @@ class TPS_Image(RIXS_Image):
 
 class DLS_Image(RIXS_Image):
     def __init__(self, file_path):
+        """
+        Load a Diamond Light Source (i21) RIXS image and its metadata from
+        a NeXus file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the .nxs file. The run number is extracted from this
+            path (expects an "i21-<digits>" pattern).
+        """
 
         super().__init__()
         self.file_path = file_path
@@ -995,27 +1301,25 @@ class DLS_Image(RIXS_Image):
 
     def _get_raw_data(self):
         """
-        Loads raw detector images and extracts relevant experimental parameters from the NeXus file.
-        
-        This method:
-        1. Loads the raw detector images from the NeXus file
-        2. Creates copies for processing (imgs_pure) and final results (imgs_processed)
-        3. Extracts dark image correction parameters (alpha, beta)
-        4. Gets image shift values from previous processing
-        5. Retrieves detector counting time
-        
-        The extracted parameters are stored as instance attributes:
-        - self.imgs: Raw detector images
-        - self.imgs_pure: Copy of raw images for processing
-        - self.imgs_processed: Array for storing processed images
-        - self.dark_poly: Dark image correction parameters [alpha, beta]
-        - self.shifts: Image shift values
-        - self.data_count_time: Detector counting time
-        
+        Load raw detector images from a NeXus file.
+
+        Reads the Andor detector data from the 'entry' group of the NeXus
+        file, falling back to 'entry1' if the first path is not found. A
+        leading axis is added if only a single 2D image is present. The
+        returned array is assigned to `self.raw_data` by the caller
+        (`__init__`) — this method does not set any instance attributes
+        itself.
+
+        Returns
+        -------
+        numpy.ndarray, dtype float32
+            Stack of raw detector images, shape (n_images, height, width).
+
         Raises
         ------
-        Exception
-            If required parameters cannot be found in the NeXus file
+        ValueError
+            If the detector data cannot be found under either 'entry' or
+            'entry1'.
         """
 
         with nxload(self.file_path,mode='r') as f:
@@ -1084,10 +1388,31 @@ class DLS_Image(RIXS_Image):
         return self.attributes
     
     def _get_energy(self):
+        """
+        Get the incident photon energy from the already-loaded attributes.
+
+        Returns
+        -------
+        float
+            Incident photon energy in eV (`self.attributes["energy"]`).
+        """
         self.energy = self.attributes["energy"]
         return self.energy
 
     def _get_normalization_factor(self):
+        """
+        Retrieve the per-image normalization factor (m4c1 monitor counts)
+        from the NeXus file.
+
+        Tries the 'entry' group first, falling back to 'entry1'. If neither
+        is found, prints a warning and defaults to 1 for every image. A
+        scalar result is broadcast to one value per image.
+
+        Returns
+        -------
+        numpy.ndarray
+            Normalization factor(s), shape (n_images,).
+        """
         with nxload(self.file_path,mode='r') as f:  
             try:
                 self.normalization_factor = f.entry['instrument']['m4c1']['m4c1'].nxvalue
@@ -1135,7 +1460,11 @@ class DLS_Image(RIXS_Image):
                 Quadratic coefficient for curvature correction
         Returns
         -------
-        None
+        tuple of (numpy.ndarray, numpy.ndarray or float)
+            imgs_processed : the background-subtracted, filtered, and
+            curvature-corrected image stack.
+            normalization_factor : normalization factor(s) for the images
+            (unchanged by this method).
         """
         self._get_dark_image(file_path_dark=kwargs.get('file_path_dark'),
                              dark_from_processed_file=kwargs.get('dark_from_processed_file', False),
@@ -1165,6 +1494,38 @@ class DLS_Image(RIXS_Image):
                         dark_median_filter_kernel_size=[5,15], 
                         dark_smoothing_parameters=[3,15], filtertype='gaussian', 
                         mean_before_spike_removal_dark=True):
+        """
+        Obtain the dark image to use for background subtraction, either by
+        loading an already-processed dark image or by loading raw dark runs
+        and filtering/smoothing them.
+
+        Result is stored on `self.dark_img`; does not return a value.
+
+        Parameters
+        ----------
+        file_path_dark : str or list of str
+            Path(s) to the dark-image file(s). If `dark_from_processed_file`
+            is True, a single HDF5 path with a pre-processed dark image; 
+            otherwise one or more NeXus files with raw dark-image runs.
+        dark_from_processed_file : bool, optional
+            If True, load an already-processed dark image via
+            `_get_processed_dark_img` instead of processing raw runs.
+            Default False.
+        hdf5_path_to_dark : str, optional
+            Path within the HDF5 file to the pre-processed dark image, used
+            only when `dark_from_processed_file` is True. Default None.
+        dark_median_filter_kernel_size : list of int, optional
+            Median filter kernel size passed to
+            `_filter_and_smooth_dark_image`. Default [5, 15].
+        dark_smoothing_parameters : list of int, optional
+            Smoothing filter parameters passed to
+            `_filter_and_smooth_dark_image`. Default [3, 15].
+        filtertype : str, optional
+            Smoothing filter type passed to `_filter_and_smooth_dark_image`.
+            Default 'gaussian'.
+        mean_before_spike_removal_dark : bool, optional
+            Passed to `_filter_and_smooth_dark_image`. Default True.
+        """
         
         
         if dark_from_processed_file:
@@ -1190,9 +1551,21 @@ class DLS_Image(RIXS_Image):
     def _get_processed_dark_img(dark_hdf5_filename,
                                path_to_dark=None):
         """
-        Gets an already processed dark image (with Leo code) from the hdf file.
-        The hdf file should contain the dark image inside the specified path.
-        Default path is ["dark_no_spikes_filtered"].
+        Load an already-processed dark image directly from an HDF5 file,
+        with no further filtering or smoothing applied.
+
+        Parameters
+        ----------
+        dark_hdf5_filename : str
+            Path to the HDF5 file containing the processed dark image.
+        path_to_dark : str, optional
+            Path within the HDF5 file to the dark image dataset. Defaults
+            to "dark_no_spikes_filtered" if not given.
+
+        Returns
+        -------
+        numpy.ndarray
+            The processed dark image, as stored in the file.
         """
 
         print(f"Using dark image from hdf file {dark_hdf5_filename}. \nNo processing done. \n")
@@ -1208,35 +1581,33 @@ class DLS_Image(RIXS_Image):
     @staticmethod
     def _get_dark_img_from_nxs(file_path_dark): #backround
         """
-        Loads and processes dark images from NeXus files.
+        Load and concatenate raw dark images from one or more NeXus files.
 
-        This method:
-        1. Loads dark images from specified run numbers (self.dark_img_run)
-        2. Converts images to float type
-        3. Averages multiple dark images if present
-        4. Accumulates total counting time
+        Parameters
+        ----------
+        file_path_dark : list of str
+            Paths to the NeXus files containing dark-image runs to load.
 
-        The processed data is stored in:
-        - self.dark_img: Averaged dark image array
-        - self.count_time: Total counting time for dark images
-
-        Raises
-        ------
-        Exception
-            If dark image files cannot be found or loaded
+        Returns
+        -------
+        tuple of (numpy.ndarray, float)
+            dark_img_raw : concatenated stack of raw dark images (not yet
+            averaged), dtype float.
+            dark_count_time : total accumulated counting time (seconds)
+            across all loaded dark-image runs.
         """
         print(f"Retrieving dark images.")
         start_time = time.perf_counter()
 
-        dark_img = np.empty((0,2048,2048)) #initializing the array
+        dark_img_raw = np.empty((0,2048,2048)) #initializing the array
         dark_count_time = 0
         for dark_path in file_path_dark:
             print(f"Retrieving dark image from file {dark_path}")
             with nxload(dark_path,mode='r') as f: #loading background
                 try:
-                    dark_img_raw = np.concatenate((dark_img, f.entry['andor']['data'].nxvalue))
+                    dark_img_raw = np.concatenate((dark_img_raw, f.entry['andor']['data'].nxvalue))
                 except:
-                    dark_img_raw = np.concatenate((dark_img, f.entry1['andor']['data'].nxvalue))
+                    dark_img_raw = np.concatenate((dark_img_raw, f.entry1['andor']['data'].nxvalue))
 
                 try:
                     dark_count_time += f.entry['instrument']['m4c1']['count_time'].nxvalue #count time
@@ -1249,7 +1620,7 @@ class DLS_Image(RIXS_Image):
         dark_img_raw = dark_img_raw.astype(float)
         #self.dark_img = self.dark_img.mean(axis=0)
 
-        print(f"Total number of dark images retrieved: {dark_img.shape[0]}")
+        print(f"Total number of dark images retrieved: {dark_img_raw.shape[0]}")
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
@@ -1264,12 +1635,18 @@ class DLS_Image(RIXS_Image):
         """
         Filters spikes from the dark image and applies smoothing filters.
 
+        Result is stored on `self.dark_img`; the method does not return a
+        value.
+
         Parameters
         ----------
-        kernel_size : list of int
+        dark_img_raw : numpy.ndarray
+            Stack of raw dark images, shape (n_images, height, width), as
+            returned by `_get_dark_img_from_nxs`.
+        kernel_size : list of int, default=[5, 15]
             Dimensions for median filter kernel. If 2D [vertical_pixels, horizontal_pixels],
             will be converted to 3D [1, vertical_pixels, horizontal_pixels]
-        filter_parameter : list of int
+        filter_parameter : list of int, default=[3, 15]
             Parameters for additional filtering:
             - For gaussian filter: sigma values [vertical, horizontal]
             - For FFT filter: cutoff frequencies [vertical, horizontal]
@@ -1279,7 +1656,7 @@ class DLS_Image(RIXS_Image):
             - 'gaussian': Gaussian smoothing with sigma values
             - 'fft': Fourier transform based filter with cutoff frequencies
             - 'butterworth': Butterworth filter with cutoff frequencie
-        mean_before_smoothing : bool, default=True
+        mean_before_spike_removal_dark : bool, default=True
             If True, averages dark images before spike removal
             If False, removes spikes from each image independently, then averages
         """
@@ -1445,11 +1822,30 @@ class DLS_Image(RIXS_Image):
     @staticmethod
     def _apply_butterworth_filter_and_plot(image, cutoff_frequency=50, order=2, plot_flag=True):
         """
-        Apply an FFT-based low-pass filter to the image and plot the FFT with cutoff.
+        Apply a 2D Butterworth low-pass filter to an image in frequency space.
 
-        params:
-        image: 2D numpy array, the input image.
-        cutoff_frequency: float, the cutoff frequency for the low-pass filter.
+        Parameters
+        ----------
+        image : numpy.ndarray
+            2D input image to be filtered.
+        cutoff_frequency : list of float, default=50
+            [vertical, horizontal] cutoff frequencies defining the elliptical
+            Butterworth mask in frequency space. Note: the default value of
+            50 is a plain int and will raise a `TypeError` if used as-is,
+            since the code indexes it as `cutoff_frequency[0]`/`[1]` — always
+            pass a 2-element list/tuple in practice.
+        order : int, optional
+            Order of the Butterworth filter; higher values give a sharper
+            transition at the cutoff. Default 2.
+        plot_flag : bool, optional
+            If True, displays plots of the original image, the FFT magnitude
+            spectrum with the cutoff ellipse, and the filtered result.
+            Default True.
+
+        Returns
+        -------
+        numpy.ndarray
+            The filtered image after applying the low-pass filter.
         """
         # Compute the 2D FFT of the image and shift the zero frequency component to the center
         f_transform = fft2(image)
@@ -1557,6 +1953,20 @@ class DLS_Image(RIXS_Image):
         print(f"Elapsed time: {elapsed_time:.2f} seconds. \n")
 
     def _fit_bkg(self):
+        """
+        Fit a linear background model (a * dark + b) per image using
+        `scipy.optimize.minimize`, as an alternative to `_fit_bkg_sklearn`.
+
+        Not currently called anywhere in this class, and not functional as
+        written: it references `self.index_start_fit_bkg`,
+        `self.dark_img_filtered`, `self.imgs_pure`, and `self.imgs`, none of
+        which are set anywhere in `DLS_Image` — calling this will raise an
+        `AttributeError`. Looks like a leftover alternative implementation
+        to `_fit_bkg_sklearn` (see also `_filter_img_old`, `_centroid_old`
+        for similar legacy methods, though unlike this one those are still
+        internally consistent). Update the referenced attribute names or
+        remove this method.
+        """
 
         print(f"Fitting background to spectrum.")
         start_time = time.perf_counter()
@@ -1729,28 +2139,26 @@ class DLS_Image(RIXS_Image):
                            curve_a,
                            curve_b=0):
         """
-        Corrects the curvature of detector images using a linear slope correction.
-        The curvature correction is performed by remapping each pixel position using:
+        Corrects the curvature of detector images using a linear/quadratic
+        slope correction, in place on `self.imgs_processed`.
+
+        The curvature correction is performed by remapping each pixel
+        position using:
             y_new = y - curve_a * x - curve_b * x**2
         where:
         - x, y are the original pixel coordinates
-        - curve_a is the curvature parameter (self.slope)
         - y_new is the corrected y-coordinate
 
-        The correction is applied to each image in imgs_pure using 2D histogram
-        binning to remap the intensity values to the corrected coordinates.
+        The correction is applied to each image in `self.imgs_processed`
+        using 2D histogram binning to remap the intensity values to the
+        corrected coordinates. Does not return a value.
 
         Parameters
         ----------
         curve_a : float
-            Linear curvature correction parameter (slope)
-        curve_b : float
-            Quadratic curvature correction parameter
-
-        Raises
-        ------
-        Exception
-            If self.slope is not defined
+            Linear curvature correction parameter (slope).
+        curve_b : float, optional
+            Quadratic curvature correction parameter. Default 0.
         """
 
         print(f"Correcting curvature of image.")
@@ -1777,6 +2185,29 @@ class DLS_Image(RIXS_Image):
 
 
     def plot_generation(self, use_spc=True, **kwargs):
+        """
+        Display diagnostic plots for the background-subtraction/filtering
+        pipeline: the mean raw image with the fitted curvature/background
+        overlaid, the dark-image scaling fit, and a sample of processed
+        RIXS spectra.
+
+        Only produces output when `use_spc` is False — since this pipeline
+        (`_remove_bkg_and_filter`) is the alternative to single-photon
+        counting. Note the default is `use_spc=True`, so calling this with
+        no arguments is a silent no-op; pass `use_spc=False` explicitly to
+        see the plots.
+
+        Parameters
+        ----------
+        use_spc : bool, optional
+            Whether single-photon-counting was used. Only `False` produces
+            a plot. Default True.
+        **kwargs : dict
+            Same processing parameters passed to `_remove_bkg_and_filter`
+            (`curve_a`, `curve_b`, `index_start_fit_bkg`), used here to
+            annotate the overlay on the mean raw image consistently with
+            how the data was actually processed.
+        """
         if not use_spc:
             # Figure 1: Dark image profiles
             plt.figure(figsize=(10,3))
@@ -1932,5 +2363,3 @@ class DLS_Image(RIXS_Image):
                     spectrum = f.processed.summary['1-RIXS image reduction']['correlated_spectrum_0'].data.nxvalue
                     
         return energyLoss, spectrum
-
-
