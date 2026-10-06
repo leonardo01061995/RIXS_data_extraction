@@ -201,12 +201,12 @@ class RIXS_Raw_Images:
 
         start_time = time.perf_counter()
         path = self.folder
-
+        
+        result = []
         for number in self.run_number:
 
             processed = False  #whether to search for processed or raw files
 
-            result = []
             number=str(number)
             #path = self.directory
             for root, dirname, files in os.walk(path): 
@@ -226,13 +226,14 @@ class RIXS_Raw_Images:
             
             for file in result:
                 print(f" - {file}")
-            self.file_names = result
+        self.file_names = result
 
         return result 
     
 
     def generate_rixs_spectra(self, 
                               use_spc,
+                            imgs_inside_run = 'all',
                             extract_curvature = False,
                             spc_parameters = {},
                             no_spc_parameters = {},
@@ -301,6 +302,16 @@ class RIXS_Raw_Images:
 
         if not self.file_names:
             return
+        
+        if imgs_inside_run is not 'all':
+            if isinstance(imgs_inside_run, list):
+                if len(imgs_inside_run) != len(self.file_names):
+                    raise ValueError("Length of imgs_inside_run list must match the number of files.")
+                else:
+                    if not all(isinstance(i, tuple) for i in imgs_inside_run):
+                        raise ValueError("All elements in imgs_inside_run must be tuples specifying the number of images inside each run to be taken.")
+            else:
+                raise ValueError("imgs_inside_run must be 'all' or a list of indices corresponding to the files.")
 
         #single photon counting parameters
         self.use_spc = use_spc
@@ -332,6 +343,7 @@ class RIXS_Raw_Images:
         print("-> Performing generation of RIXS spectra from images and curvature correction.")
         start_time = time.perf_counter()
         raw_imgs = []
+        spec_index = 0
         for run_index, filename in enumerate(self.file_names):
             # Create edf_image instance and process
             if self.facility == "ESRF":
@@ -362,9 +374,11 @@ class RIXS_Raw_Images:
                                             plot_generation=plot_generation)
 
             raw_imgs.append(img)
+            if imgs_inside_run == 'all':
+                imgs_inside_run = [(0, img.imgs_processed.shape[0])] * len(self.file_names)  # Default to all images for each file
 
-            for i, rixs_2d in enumerate(img.imgs_processed):
-
+            for i, rixs_2d in enumerate(img.imgs_processed[imgs_inside_run[run_index][0]:imgs_inside_run[run_index][1],:,:]):
+                print(f"\tProcessing images from index {imgs_inside_run[run_index][0]} to {imgs_inside_run[run_index][1]} from file {filename} ")
                 # Create x, y, norm arrays as 1D vectors
                 x = np.arange(rixs_2d.shape[1])/spc_parameters["subdivide_bins_factor_y"] if use_spc else np.arange(rixs_2d.shape[1])
                 y = rixs_2d.mean(axis=1)
@@ -384,13 +398,16 @@ class RIXS_Raw_Images:
                         "norm_name": norm_name,
                         'run': str(img.run_number),
                         'filename': filename,
+                        'mirror': img.normalization_factor[i]
                     }
                 )
-                self.ds_1d[f"{i}"] = da
+                self.ds_1d[f"{spec_index}"] = da.copy(deep=True)
 
                 #append the 1D processed spectra to the list
                 self.one_d_processed_spectra.append(y)
-            
+
+                spec_index += 1
+
             # img.normalization_factor is an array (one value per sub-image); extend the list with its elements
             self.normalization_factors.extend(np.asarray(img.normalization_factor).tolist())
 
