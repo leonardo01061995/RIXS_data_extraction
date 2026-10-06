@@ -515,7 +515,7 @@ class SpecFile:
                             self.normalized_data[scan].attrs[motor] = np.nan
                             print(f"\tWarning: Motor '{motors_dict[motor]}' not found in scan {scan}. Setting its value to NaN.")
                     if 'hu70cp' in ds.attrs and 'hu70ap' in ds.attrs:
-                        self.normalized_data[scan].attrs['polarization'] = self._determine_polarization(
+                        self.normalized_data[scan].attrs['polarization'] = _determine_polarization(
                             ds[scan].attrs['hu70ap'],
                             ds[scan].attrs['hu70cp']
                         )
