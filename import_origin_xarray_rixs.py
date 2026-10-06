@@ -9,15 +9,18 @@ import xarray as xr
 
 def read_file(file):
     # Open the xarray dataset
-    ds = xr.open_dataset(file, engine='h5netcdf')
+    ds_old = xr.open_dataset(file, engine='h5netcdf')
     # Extract attributes from each DataArray and concatenate values for each key
-    attr_keys = list(next(iter(ds.data_vars.values())).attrs.keys())
+    attr_keys = list(next(iter(ds_old.data_vars.values())).attrs.keys())
     metadata = {key: [] for key in attr_keys}
-    for da in ds.data_vars.values():
+    ds_new = xr.Dataset()
+    for da in ds_old.data_vars.values():
+        da_subset = da.sel(variable=['x', 'y','error'] if 'error' in da.coords['variable'] else ['x', 'y'])
         for key in attr_keys:
             metadata[key].append(da.attrs.get(key, None)) 
+        ds_new[da.name] = da_subset
 
-    return ds, metadata
+    return ds_new, metadata
 
 def filter_metadata(metadata):
     # Filter out metadata keys that are not relevant for display
@@ -155,7 +158,6 @@ for scan in data_vars:
     else:
         save_error = False
         break
-
 
 df = create_pandaframe(ds)
 longname_list = get_longname_list(ds, save_error)
